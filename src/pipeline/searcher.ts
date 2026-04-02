@@ -1,4 +1,4 @@
-import pg from "pg"
+import {pool} from "../db.js"
 import {embed} from "./embedder.js"
 
 export interface SearchResult
@@ -15,10 +15,7 @@ export async function search(query: string, limit: number = 5): Promise<SearchRe
     const [vec] = await embed([query])
     const vectorStr = `[${vec.join(",")}]`
 
-    const db = new pg.Client(process.env.DATABASE_URL)
-    await db.connect()
-
-    const res = await db.query(`
+    const res = await pool.query(`
         SELECT content,
                source,
                metadata,
@@ -29,6 +26,5 @@ export async function search(query: string, limit: number = 5): Promise<SearchRe
         LIMIT $2
     `, [vectorStr, limit])
 
-    await db.end()
     return res.rows
 }

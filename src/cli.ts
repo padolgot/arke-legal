@@ -1,9 +1,7 @@
 import "dotenv/config"
 import {readFileSync, readdirSync, statSync} from "fs"
 import {basename} from "path"
-import {ingest, type Doc} from "./ingestion.js"
-import {search} from "./searcher.js"
-import {ask} from "./inference.js"
+import {ingest, search, ask, type Doc} from "./pipeline/index.js"
 
 const command = process.argv[2]
 
