@@ -6,13 +6,8 @@ import {evaluate, type EvalMetrics} from "./evaluation.js"
 
 interface SweepRow
 {
-    chunkSize: number
-    overlap: number
-    alpha: number
-    k: number
-    precision: number
-    recall: number
-    mrr: number
+    cfg: PipelineConfig
+    metrics: EvalMetrics
 }
 
 export async function sweep(presets: PipelineConfig[], limit: number, sourcePath?: string): Promise<SweepRow[]>
@@ -41,22 +36,13 @@ export async function sweep(presets: PipelineConfig[], limit: number, sourcePath
         }
 
         const result = await evaluate(cases, cfg.search)
-        const avg: EvalMetrics = result.average
+        rows.push({ cfg, metrics: result.average })
 
-        rows.push({
-            chunkSize: cfg.chunk.chunkSize,
-            overlap: cfg.chunk.overlap,
-            alpha: cfg.search.alpha,
-            k: cfg.search.k,
-            precision: avg.precision,
-            recall: avg.recall,
-            mrr: avg.mrr,
-        })
-
-        console.log(`sweep: P=${avg.precision.toFixed(3)} R=${avg.recall.toFixed(3)} MRR=${avg.mrr.toFixed(3)}`)
+        const m = result.average
+        console.log(`sweep: P=${m.precision.toFixed(3)} R=${m.recall.toFixed(3)} MRR=${m.mrr.toFixed(3)}`)
     }
 
-    rows.sort((a, b) => b.mrr - a.mrr)
+    rows.sort((a, b) => b.metrics.mrr - a.metrics.mrr)
     printTable(rows)
 
     return rows
@@ -76,13 +62,13 @@ function printTable(rows: SweepRow[])
     for (const r of rows)
     {
         console.log(
-            `${r.chunkSize.toString().padStart(9)}`
-            + ` | ${r.overlap.toString().padStart(7)}`
-            + ` | ${r.alpha.toFixed(1).padStart(5)}`
-            + ` | ${r.k.toString().padStart(2)}`
-            + ` | ${r.precision.toFixed(3).padStart(9)}`
-            + ` | ${r.recall.toFixed(3).padStart(6)}`
-            + ` | ${r.mrr.toFixed(3)}`
+            `${r.cfg.chunk.chunkSize.toString().padStart(9)}`
+            + ` | ${r.cfg.chunk.overlap.toString().padStart(7)}`
+            + ` | ${r.cfg.search.alpha.toFixed(1).padStart(5)}`
+            + ` | ${r.cfg.search.k.toString().padStart(2)}`
+            + ` | ${r.metrics.precision.toFixed(3).padStart(9)}`
+            + ` | ${r.metrics.recall.toFixed(3).padStart(6)}`
+            + ` | ${r.metrics.mrr.toFixed(3)}`
         )
     }
 }

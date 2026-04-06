@@ -34,10 +34,12 @@ async function generateQuestions(content: string): Promise<string[]>
     const json = await res.json() as { message: { content: string } }
     const raw = json.message.content.trim()
 
-    const match = raw.match(/\[[\s\S]*\]/)
+    const match = raw.match(/\[[\s\S]*]/)
     if (!match) return []
 
-    const parsed = JSON.parse(match[0]) as unknown
+    let parsed: unknown
+    try { parsed = JSON.parse(match[0]) }
+    catch { return [] }
     if (!Array.isArray(parsed)) return []
 
     return parsed.filter((q): q is string => typeof q === "string" && q.length > 0)

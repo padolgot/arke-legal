@@ -1,6 +1,6 @@
 import "dotenv/config"
 import {loadConfig, ingest, search, infer} from "./pipeline/index.js"
-import {sweep, parseSweepLevel, getPreset} from "./eval/index.js"
+import {sweep, getPreset} from "./eval/index.js"
 
 const cfg = loadConfig()
 const command = process.argv[2]
@@ -45,7 +45,7 @@ else if (command === "ask")
     }
 
     const results = await search(query, cfg.search)
-    console.log(`ask: ${results.length} context chunks`)
+    console.log(`searched: ${results.length} context chunks`)
 
     const answer = await infer(query, results)
     console.log(`\n${answer}\n`)
@@ -59,10 +59,9 @@ else if (command === "sweep")
         process.exit(1)
     }
 
-    const level = parseSweepLevel(levelStr)
     const limit = Number(process.argv[4]) || 30
     const sourcePath = process.env.SOURCE_PATH
-    const presets = getPreset(level)
+    const presets = getPreset(levelStr)
 
     await sweep(presets, limit, sourcePath)
 }

@@ -26,15 +26,16 @@ export function chunk(text: string, cfg: ChunkConfig): ChunkData[]
     if (!text) return []
 
     const clean = merge(separate(text.trim(), cfg.chunkSize), cfg.chunkSize)
+    const overlapChars = Math.floor(cfg.chunkSize * cfg.overlap)
     const result: ChunkData[] = []
 
     for (let i = 0; i < clean.length; i++)
     {
-        const head = (cfg.overlap > 0 && i > 0)
-            ? clean[i - 1].slice(-cfg.overlap)
+        const head = (overlapChars > 0 && i > 0)
+            ? clean[i - 1].slice(-overlapChars)
             : ""
-        const tail = (cfg.overlap > 0 && i < clean.length - 1)
-            ? clean[i + 1].slice(0, cfg.overlap)
+        const tail = (overlapChars > 0 && i < clean.length - 1)
+            ? clean[i + 1].slice(0, overlapChars)
             : ""
         result.push(new ChunkData(clean[i], head, tail))
     }
