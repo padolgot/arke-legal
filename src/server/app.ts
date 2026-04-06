@@ -1,5 +1,5 @@
 import express, {type Request, type Response, type NextFunction} from "express"
-import {rateLimit} from "./rate-limit.js"
+import {rateLimit} from "./rate-limiter.js"
 import {router} from "./routes.js"
 
 const REQUEST_TIMEOUT = 60_000

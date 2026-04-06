@@ -12,3 +12,6 @@ dist/
 .idea/
 tests/
 todo.md
+.design/
+.research/
+.eval/

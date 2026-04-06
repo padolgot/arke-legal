@@ -1,7 +1,9 @@
 import {Router, type Request, type Response, type NextFunction} from "express"
 import {SearchBody, AskBody, IngestBody} from "./schemas.js"
-import {search, ask, ingest, type Doc} from "../pipeline/index.js"
+import {loadConfig, search, infer, ingest} from "../pipeline/index.js"
 import {pool} from "../db.js"
+
+const cfg = loadConfig()
 
 export const router = Router()
 
@@ -16,7 +18,7 @@ router.post("/search", async (req: Request, res: Response, next: NextFunction) =
             return
         }
 
-        const results = await search(parsed.data.query, parsed.data.limit)
+        const results = await search(parsed.data.query, cfg.search)
         res.json({results})
     }
     catch (err)
@@ -36,7 +38,8 @@ router.post("/ask", async (req: Request, res: Response, next: NextFunction) =>
             return
         }
 
-        const answer = await ask(parsed.data.query, parsed.data.limit)
+        const results = await search(parsed.data.query, cfg.search)
+        const answer = await infer(parsed.data.query, results)
         res.json({answer})
     }
     catch (err)
@@ -56,8 +59,8 @@ router.post("/ingest", async (req: Request, res: Response, next: NextFunction) =
             return
         }
 
-        await ingest(parsed.data.docs as Doc[])
-        res.json({ok: true, count: parsed.data.docs.length})
+        await ingest(parsed.data.sourcePath, cfg.chunk)
+        res.json({ok: true})
     }
     catch (err)
     {

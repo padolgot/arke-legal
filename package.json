@@ -6,7 +6,8 @@
     "ingest": "tsx src/cli.ts ingest",
     "search": "tsx src/cli.ts search",
     "ask": "tsx src/cli.ts ask",
-    "serve": "tsx src/server/index.ts"
+    "serve": "tsx src/server/index.ts",
+    "eval": "tsx src/cli.ts eval"
   },
   "author": "mikepromo <mikepromogratus@proton.me>",
   "license": "ISC",
