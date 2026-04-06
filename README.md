@@ -2,31 +2,20 @@
 
 Local RAG pipeline.
 
-## Schema
+## Setup
 
-```sql
-CREATE EXTENSION vector;
+Set `DATABASE_URL`, `EMBEDDER_URL`, `EMBEDDER_MODEL`, `EMBEDDING_DIM`, `INFERENCE_URL`, `INFERENCE_MODEL` in `.env`, then:
 
-CREATE TABLE chunks (
-    id          SERIAL PRIMARY KEY,
-    source      TEXT NOT NULL CHECK (length(source) > 0),
-    chunk_index INTEGER NOT NULL CHECK (chunk_index >= 0),
-    content     TEXT NOT NULL CHECK (length(content) > 0),
-    embedding   vector(1024) NOT NULL,
-    metadata    JSONB NOT NULL DEFAULT '{}' CHECK (jsonb_typeof(metadata) = 'object'),
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    tsv         tsvector GENERATED ALWAYS AS (to_tsvector('simple', content)) STORED NOT NULL
-);
-
-CREATE UNIQUE INDEX chunks_content_unique ON chunks (md5(content));
-CREATE INDEX chunks_tsv_idx ON chunks USING GIN (tsv);
+```bash
+npm run cli init
 ```
 
 ## Usage
 
 ```bash
-npx tsx src/cli.ts ingest <file.jsonl | dir>
-npx tsx src/cli.ts search "query"
-npx tsx src/cli.ts ask "query"
-npx tsx src/cli.ts sweep <fast|medium|thorough> [limit]
+npm run cli ingest <file.jsonl | dir>
+npm run cli search "query"
+npm run cli ask "query"
+npm run cli sweep <fast|medium|thorough> [limit]
+npm run serve
 ```

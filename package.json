@@ -3,19 +3,14 @@
   "version": "1.0.0",
   "description": "Local RAG pipeline — chunk, embed, store, search, infer",
   "scripts": {
-    "ingest": "tsx src/cli.ts ingest",
-    "search": "tsx src/cli.ts search",
-    "ask": "tsx src/cli.ts ask",
-    "serve": "tsx src/server/index.ts",
-    "eval": "tsx src/cli.ts eval"
+    "cli": "tsx --env-file=.env src/cli.ts",
+    "serve": "tsx --env-file=.env src/server/index.ts"
   },
   "author": "mikepromo <mikepromogratus@proton.me>",
   "license": "ISC",
   "dependencies": {
-    "dotenv": "^17.3.1",
     "express": "^5.2.1",
-    "pg": "^8.20.0",
-    "zod": "^4.3.6"
+    "pg": "^8.20.0"
   },
   "devDependencies": {
     "@types/express": "^5.0.6",

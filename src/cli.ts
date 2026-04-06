@@ -1,11 +1,15 @@
-import "dotenv/config"
 import {loadConfig, ingest, search, infer} from "./pipeline/index.js"
 import {sweep, getPreset} from "./eval/index.js"
+import {init} from "./init.js"
 
 const cfg = loadConfig()
 const command = process.argv[2]
 
-if (command === "ingest")
+if (command === "init")
+{
+    await init()
+}
+else if (command === "ingest")
 {
     const target = process.argv[3]
     if (!target)
@@ -45,8 +49,6 @@ else if (command === "ask")
     }
 
     const results = await search(query, cfg.search)
-    console.log(`searched: ${results.length} context chunks`)
-
     const answer = await infer(query, results)
     console.log(`\n${answer}\n`)
 }
@@ -61,6 +63,11 @@ else if (command === "sweep")
 
     const limit = Number(process.argv[4]) || 30
     const sourcePath = process.env.SOURCE_PATH
+    if (!sourcePath)
+    {
+        console.error("sweep requires SOURCE_PATH in .env")
+        process.exit(1)
+    }
     const presets = getPreset(levelStr)
 
     await sweep(presets, limit, sourcePath)
@@ -68,6 +75,7 @@ else if (command === "sweep")
 else
 {
     console.error("Usage:")
+    console.error("  npx tsx src/cli.ts init")
     console.error("  npx tsx src/cli.ts ingest <file.jsonl | directory>")
     console.error("  npx tsx src/cli.ts search \"query\"")
     console.error("  npx tsx src/cli.ts ask \"query\"")

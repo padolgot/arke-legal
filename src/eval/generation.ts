@@ -62,8 +62,6 @@ export async function generate(limit: number = 50): Promise<EvalCase[]>
         {
             cases.push({ query: q, expected_ids: [row.id] })
         }
-
-        console.log(`  [${cases.length}] ${questions.length} questions from chunk ${row.id.slice(0, 8)}`)
     }
 
     return cases

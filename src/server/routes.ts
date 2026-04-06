@@ -1,5 +1,5 @@
 import {Router, type Request, type Response, type NextFunction} from "express"
-import {SearchBody, AskBody, IngestBody} from "./schemas.js"
+import {requireString, isValidationError} from "./validate.js"
 import {loadConfig, search, infer, ingest} from "../pipeline/index.js"
 import {pool} from "../db.js"
 
@@ -11,14 +11,10 @@ router.post("/search", async (req: Request, res: Response, next: NextFunction) =
 {
     try
     {
-        const parsed = SearchBody.safeParse(req.body)
-        if (!parsed.success)
-        {
-            res.status(400).json({error: parsed.error.issues})
-            return
-        }
+        const query = requireString(req.body, "query")
+        if (isValidationError(query)) { res.status(400).json(query); return }
 
-        const results = await search(parsed.data.query, cfg.search)
+        const results = await search(query, cfg.search)
         res.json({results})
     }
     catch (err)
@@ -31,15 +27,11 @@ router.post("/ask", async (req: Request, res: Response, next: NextFunction) =>
 {
     try
     {
-        const parsed = AskBody.safeParse(req.body)
-        if (!parsed.success)
-        {
-            res.status(400).json({error: parsed.error.issues})
-            return
-        }
+        const query = requireString(req.body, "query")
+        if (isValidationError(query)) { res.status(400).json(query); return }
 
-        const results = await search(parsed.data.query, cfg.search)
-        const answer = await infer(parsed.data.query, results)
+        const results = await search(query, cfg.search)
+        const answer = await infer(query, results)
         res.json({answer})
     }
     catch (err)
@@ -52,14 +44,10 @@ router.post("/ingest", async (req: Request, res: Response, next: NextFunction) =
 {
     try
     {
-        const parsed = IngestBody.safeParse(req.body)
-        if (!parsed.success)
-        {
-            res.status(400).json({error: parsed.error.issues})
-            return
-        }
+        const sourcePath = requireString(req.body, "sourcePath")
+        if (isValidationError(sourcePath)) { res.status(400).json(sourcePath); return }
 
-        await ingest(parsed.data.sourcePath, cfg.chunk)
+        await ingest(sourcePath, cfg.chunk)
         res.json({ok: true})
     }
     catch (err)

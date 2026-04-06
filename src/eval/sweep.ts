@@ -1,6 +1,6 @@
 import {ingest} from "../pipeline/index.js"
 import {pool} from "../db.js"
-import {type PipelineConfig, type ChunkConfig} from "../pipeline/config.js"
+import {type PipelineConfig, type ChunkConfig, type SearchConfig} from "../pipeline/config.js"
 import {generate} from "./generation.js"
 import {evaluate, type EvalMetrics} from "./evaluation.js"
 
@@ -10,36 +10,36 @@ interface SweepRow
     metrics: EvalMetrics
 }
 
-export async function sweep(presets: PipelineConfig[], limit: number, sourcePath?: string): Promise<SweepRow[]>
+interface ChunkGroup
 {
+    chunk: ChunkConfig
+    searches: SearchConfig[]
+}
+
+export async function sweep(presets: PipelineConfig[], limit: number, sourcePath: string): Promise<SweepRow[]>
+{
+    const groups = groupByChunk(presets)
     const rows: SweepRow[] = []
-    let lastChunk: ChunkConfig | null = null
-    let cases: Awaited<ReturnType<typeof generate>> = []
+    let i = 0
 
-    for (let i = 0; i < presets.length; i++)
+    for (const group of groups)
     {
-        const cfg = presets[i]
-        console.log(`\nsweep [${i + 1}/${presets.length}] chunkSize=${cfg.chunk.chunkSize} overlap=${cfg.chunk.overlap} alpha=${cfg.search.alpha} k=${cfg.search.k}`)
+        await pool.query("TRUNCATE chunks")
+        await ingest(sourcePath, group.chunk)
 
-        if (!sameChunk(cfg.chunk, lastChunk))
+        const cases = await generate(limit)
+        console.log(`sweep: generated ${cases.length} cases from ${limit} chunks`)
+
+        for (const search of group.searches)
         {
-            if (!sourcePath) throw new Error("sweep requires SOURCE_PATH in .env when chunk config changes between presets")
+            i++
+            console.log(`\nsweep [${i}/${presets.length}] chunkSize=${group.chunk.chunkSize} overlap=${group.chunk.overlap} alpha=${search.alpha} k=${search.k}`)
 
-            console.log(`sweep: TRUNCATE + re-ingest`)
-            await pool.query("TRUNCATE chunks")
-            await ingest(sourcePath, cfg.chunk)
+            const metrics = (await evaluate(cases, search)).average
+            rows.push({cfg: {chunk: group.chunk, search}, metrics})
 
-            cases = await generate(limit)
-            console.log(`sweep: ${cases.length} eval cases generated`)
-
-            lastChunk = cfg.chunk
+            console.log(`sweep: P=${metrics.precision.toFixed(3)} R=${metrics.recall.toFixed(3)} MRR=${metrics.mrr.toFixed(3)}`)
         }
-
-        const result = await evaluate(cases, cfg.search)
-        rows.push({ cfg, metrics: result.average })
-
-        const m = result.average
-        console.log(`sweep: P=${m.precision.toFixed(3)} R=${m.recall.toFixed(3)} MRR=${m.mrr.toFixed(3)}`)
     }
 
     rows.sort((a, b) => b.metrics.mrr - a.metrics.mrr)
@@ -48,10 +48,24 @@ export async function sweep(presets: PipelineConfig[], limit: number, sourcePath
     return rows
 }
 
-function sameChunk(a: ChunkConfig, b: ChunkConfig | null): boolean
+function groupByChunk(presets: PipelineConfig[]): ChunkGroup[]
 {
-    if (b === null) return false
-    return a.chunkSize === b.chunkSize && a.overlap === b.overlap
+    const groups: ChunkGroup[] = []
+
+    for (const p of presets)
+    {
+        const existing = groups.find(g => g.chunk.chunkSize === p.chunk.chunkSize && g.chunk.overlap === p.chunk.overlap)
+        if (existing)
+        {
+            existing.searches.push(p.search)
+        }
+        else
+        {
+            groups.push({chunk: p.chunk, searches: [p.search]})
+        }
+    }
+
+    return groups
 }
 
 function printTable(rows: SweepRow[])
