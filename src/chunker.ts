@@ -1,4 +1,4 @@
-import {type ChunkConfig} from "./config.js"
+import {type ChunkConfig} from "./defaults.js"
 
 const SEPARATORS = ["\n\n", "\n", ". ", ", ", " ", ""]
 

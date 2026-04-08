@@ -1,0 +1,22 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "rootDir": "src",
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "noEmit": false
+  },
+  "include": [
+    "src/index.ts",
+    "src/mneme.ts",
+    "src/embedder.ts",
+    "src/llm.ts",
+    "src/store.ts",
+    "src/eval.ts",
+    "src/defaults.ts",
+    "src/chunker.ts",
+    "src/presets.ts"
+  ]
+}

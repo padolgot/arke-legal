@@ -1,23 +1,42 @@
 {
-  "name": "mneme",
-  "version": "1.0.0",
-  "description": "Local RAG pipeline — chunk, embed, store, search, infer",
-  "scripts": {
-    "cli": "tsx --env-file=.env src/cli.ts",
-    "serve": "tsx --env-file=.env src/server/index.ts"
+  "name": "@nerva/mneme",
+  "version": "0.1.0",
+  "description": "Local RAG pipeline",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
   },
-  "author": "mikepromo <mikepromogratus@proton.me>",
+  "files": ["dist", "README.md"],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "prepublishOnly": "npm run build",
+    "cli": "tsx --env-file=.env src/cli.ts"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "keywords": ["rag", "pgvector", "postgres", "embeddings", "eval", "typescript", "ollama"],
+  "author": "padolgot",
   "license": "ISC",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/padolgot/mneme.git"
+  },
   "dependencies": {
-    "express": "^5.2.1",
     "pg": "^8.20.0"
   },
   "devDependencies": {
-    "@types/express": "^5.0.6",
     "@types/node": "^25.5.0",
     "@types/pg": "^8.20.0",
     "tsx": "^4.21.0",
     "typescript": "^6.0.2"
-  },
-  "type": "module"
+  }
 }
