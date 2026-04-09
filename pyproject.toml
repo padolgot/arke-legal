@@ -1,0 +1,28 @@
+[project]
+name = "mneme"
+version = "0.1.0"
+description = "Production-ready RAG module with hybrid search and built-in eval"
+requires-python = ">=3.12"
+dependencies = [
+    "asyncpg>=0.29",
+    "pgvector>=0.3",
+    "httpx>=0.27",
+    "numpy>=2.0",
+    "click>=8.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+mneme = "mneme.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["mneme"]

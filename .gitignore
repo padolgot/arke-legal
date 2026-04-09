@@ -12,6 +12,6 @@ dist/
 .idea/
 tests/
 todo.md
+CLAUDE.md
 .design/
-.research/
 .eval/
