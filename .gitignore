@@ -1,17 +1,28 @@
-node_modules/
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
 dist/
-*.tsbuildinfo
+.venv/
+venv/
 
+# Env
 .env
 .env.*
 !.env.example
 
-*.log
-*.tgz
-
+# Editors
 .idea/
-tests/
-todo.md
+.vscode/
+
+# Logs
+*.log
+
+# Project-local notes
 CLAUDE.md
 .design/
 .eval/
+todo.md
+tests/
