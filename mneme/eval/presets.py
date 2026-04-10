@@ -1,26 +1,51 @@
 from dataclasses import replace
 from itertools import product
 
-from ..core.config import MnemeConfig, resolve_config
+from ..core.config import Config
+
+FAST = "fast"
+MEDIUM = "medium"
+THOROUGH = "thorough"
 
 
-def get_preset(level: str, base: MnemeConfig) -> list[MnemeConfig]:
-    """Expands a sweep level into a list of concrete configs to evaluate.
-    Each returned config is a copy of `base` with one combination of
-    chunk_size/overlap/alpha/k applied."""
-    if level == "fast":
-        return _expand(base, [base.chunk_size], [base.overlap], [base.alpha], [base.k])
-    if level == "medium":
-        return _expand(base, [base.chunk_size], [base.overlap], [0.0, 0.3, 0.5, 0.7, 1.0], [5, 10, 20])
-    if level == "thorough":
-        return _expand(base, [500, 1000], [0.0, 0.2], [0.0, 0.3, 0.5, 0.7, 1.0], [5, 10, 20])
-    raise ValueError(f"unknown sweep level: {level} (expected: fast | medium | thorough)")
+def get_preset(level: str, base: Config) -> list[Config]:
+    """Expands a sweep level into concrete configs with all parameter combinations."""
+    if level == FAST:
+        return _expand(
+            base,
+            chunk_sizes=[base.chunk_size],
+            overlaps=[base.overlap],
+            alphas=[base.alpha],
+            ks=[base.k],
+        )
+    if level == MEDIUM:
+        return _expand(
+            base,
+            chunk_sizes=[base.chunk_size],
+            overlaps=[base.overlap],
+            alphas=[0.0, 0.3, 0.5, 0.7, 1.0],
+            ks=[5, 10, 20],
+        )
+    if level == THOROUGH:
+        return _expand(
+            base,
+            chunk_sizes=[500, 1000],
+            overlaps=[0.0, 0.2],
+            alphas=[0.0, 0.3, 0.5, 0.7, 1.0],
+            ks=[5, 10, 20],
+        )
+    raise ValueError(f"unknown sweep level: {level} (expected: {FAST} | {MEDIUM} | {THOROUGH})")
 
 
-def _expand(base: MnemeConfig, chunk_sizes, overlaps, alphas, ks) -> list[MnemeConfig]:
-    out: list[MnemeConfig] = []
+def _expand(
+    base: Config,
+    chunk_sizes: list[int],
+    overlaps: list[float],
+    alphas: list[float],
+    ks: list[int],
+) -> list[Config]:
+    out: list[Config] = []
     for chunk_size, overlap, alpha, k in product(chunk_sizes, overlaps, alphas, ks):
         cfg = replace(base, chunk_size=chunk_size, overlap=overlap, alpha=alpha, k=k)
-        resolve_config(cfg)
-        out.append(cfg)
+        out.append(cfg.resolved())
     return out

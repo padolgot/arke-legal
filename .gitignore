@@ -20,6 +20,9 @@ venv/
 # Logs
 *.log
 
+# Cache
+.cache/
+
 # Project-local notes
 CLAUDE.md
 .design/

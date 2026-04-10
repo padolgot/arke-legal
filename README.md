@@ -1,35 +1,38 @@
 # Mneme
 
-Local RAG pipeline with built-in evaluation. Postgres + pgvector for hybrid search, Ollama for embeddings and inference.
+Local RAG pipeline with built-in evaluation. Postgres + pgvector for hybrid search, Ollama or OpenAI for embeddings and inference.
 
 ## Setup
 
-Requires Python 3.12+, [uv](https://docs.astral.sh/uv/), Postgres with the `pgvector` extension, and a running Ollama instance.
+Requires Python 3.12+, [uv](https://docs.astral.sh/uv/), Postgres with the `pgvector` extension.
 
-Copy `.env.example` to `.env` and fill in your values, then install and initialize the schema:
+Copy `.env.example` to `.env` and fill in your values, then install:
 
 ```bash
 cp .env.example .env
 uv sync
-uv run python -m mneme.cli init
 ```
 
 ## Usage
 
 ```bash
-uv run python -m mneme.cli ingest <file.jsonl | dir>
-uv run python -m mneme.cli ask "query"
-uv run python -m mneme.cli sweep <fast|medium|thorough> --limit 30
+uv run mneme ingest <file.jsonl | dir>
+uv run mneme ask "query"
+uv run mneme sweep <fast|medium|thorough> --limit 30
 ```
 
-`sweep` reads `SOURCE_PATH` from the environment.
+`sweep` without a source path downloads SQuAD as a test corpus. To use your own data:
+
+```bash
+uv run mneme sweep medium ./corpus
+```
 
 ## Library
 
 ```python
-from mneme import Mneme, MnemeConfig, Eval
+from mneme import Mneme, Config, Eval
 
-cfg = MnemeConfig(database_url="postgresql://...")
+cfg = Config(database_url="postgresql://...", provider="openai", provider_api_key="sk-...")
 
 async with Mneme(cfg) as m:
     await m.ingest("./corpus")

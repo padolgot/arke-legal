@@ -1,86 +1,102 @@
 from dataclasses import dataclass
 
-from ..core.config import MnemeConfig
+from .. import Mneme
+from ..core.config import Config
 from ..core.models import embed
-from ..mneme import Mneme
+from ..core.types import Chunk
+from .cache import Cache, corpus_hash
+from .corpus import SQUAD_URL, SQUAD_LIMIT, download_squad
 from .gen import make_cases
-from .metrics import EvalMetrics, score
+from .metrics import EvalCase, EvalMetrics, EvalResult, score
 from .presets import get_preset
 
 
 @dataclass(frozen=True)
 class SweepRow:
-    """One evaluated configuration: the exact cfg used and the metrics
-    it produced. Self-contained — a list of these is enough to reproduce,
-    compare, or render a sweep."""
-    cfg: MnemeConfig
+    cfg: Config
     metrics: EvalMetrics
 
 
-async def run_sweep(base_cfg: MnemeConfig, level: str, limit: int, source_path: str) -> list[SweepRow]:
+async def run_sweep(base_cfg: Config, level: str, limit: int, source_path: str = "") -> list[SweepRow]:
+    source_path = _ensure_corpus(source_path)
+
     configs = get_preset(level, base_cfg)
-    groups = _group_by_chunking(configs)
     rows: list[SweepRow] = []
-    i = 0
+    chash = corpus_hash(source_path)
 
-    for (chunk_size, overlap), group in groups.items():
-        # Fresh Mneme per group: its cfg is immutable, so changing chunk
-        # settings means a new instance. Pool recreation is cheap compared
-        # to re-ingest (embeddings dominate).
-        async with Mneme(group[0]) as m:
+    for idx, cfg in enumerate(configs):
+        async with Mneme(cfg) as m:
             await m.reset()
-            await m.ingest(source_path)
+            await _ensure_chunks(m, chash, cfg.chunk_size, cfg.overlap, source_path)
+            cases = await _ensure_cases(m, chash, cfg.chunk_size, cfg.overlap, limit)
 
-            cases = await make_cases(m, limit)
-            print(f"sweep: generated {len(cases)} cases from {limit} chunks")
+            queries = [c.query for c in cases]
+            vectors = await embed(m.cfg, m.http, queries)
 
-            for cfg in group:
-                i += 1
-                print(
-                    f"\nsweep [{i}/{len(configs)}] "
-                    f"chunk_size={cfg.chunk_size} overlap={cfg.overlap} "
-                    f"alpha={cfg.alpha} k={cfg.k}"
-                )
+            results: list[EvalResult] = []
+            for i, case in enumerate(cases):
+                hits = await m.db.search(vectors[i], case.query, cfg.alpha, cfg.k)
+                results.append(EvalResult(hits=hits, expected_ids=case.expected_ids))
 
-                per_case = []
-                for c in cases:
-                    vectors = await embed(m._http, m.cfg.embedder_url, m.cfg.embedder_model, [c.query])
-                    hits = await m.db.search(vectors[0], c.query, cfg.alpha, cfg.k)
-                    per_case.append((hits, c.expected_ids))
+            metrics = score(results)
+            rows.append(SweepRow(cfg=cfg, metrics=metrics))
+            print(f"  eval {idx + 1}/{len(configs)}: chunk={cfg.chunk_size} overlap={cfg.overlap} alpha={cfg.alpha:.1f} k={cfg.k}")
 
-                metrics = score(per_case)
-                rows.append(SweepRow(cfg=cfg, metrics=metrics))
-
-                print(f"sweep: P={metrics.precision:.3f} R={metrics.recall:.3f} MRR={metrics.mrr:.3f}")
-
-    # Sorted by MRR — the most telling retrieval metric.
     rows.sort(key=lambda r: r.metrics.mrr, reverse=True)
     _print_table(rows)
     return rows
 
 
-def _group_by_chunking(configs: list[MnemeConfig]) -> dict[tuple[int, float], list[MnemeConfig]]:
-    """Groups configs that share chunk_size+overlap. Re-ingest happens once
-    per group; within a group only cheap search params (alpha, k) change."""
-    groups: dict[tuple[int, float], list[MnemeConfig]] = {}
-    for cfg in configs:
-        key = (cfg.chunk_size, cfg.overlap)
-        groups.setdefault(key, []).append(cfg)
-    return groups
+def _ensure_corpus(source_path: str) -> str:
+    """Returns path to corpus file. Downloads SQuAD if no source provided."""
+    if source_path:
+        return source_path
+
+    cache = Cache("corpus", url=SQUAD_URL, limit=SQUAD_LIMIT)
+    if not cache.exists():
+        cache.save(download_squad())
+    return str(cache.path)
+
+
+async def _ensure_chunks(m: Mneme, chash: str, chunk_size: int, overlap: float, source_path: str) -> None:
+    cache = Cache("embeddings", corpus=chash, chunk_size=chunk_size, overlap=overlap, model=m.cfg.embedder_model)
+    cached = cache.load()
+    if cached is not None:
+        chunks = [Chunk.from_dict(d) for d in cached]
+        await m.db.insert(chunks)
+        print(f"cache hit: {len(chunks)} chunks from disk")
+    else:
+        await m.ingest(source_path)
+        chunks = await m.db.fetch_all()
+        cache.save([c.to_dict() for c in chunks])
+
+
+async def _ensure_cases(m: Mneme, chash: str, chunk_size: int, overlap: float, limit: int) -> list[EvalCase]:
+    cache = Cache("cases", corpus=chash, chunk_size=chunk_size, overlap=overlap, model=m.cfg.inference_model)
+    cached = cache.load()
+    if cached is not None:
+        cases = [EvalCase(query=c["query"], expected_ids=c["expected_ids"]) for c in cached]
+        print(f"cache hit: {len(cases)} eval cases from disk")
+        return cases
+
+    cases = await make_cases(m, limit)
+    cache.save([{"query": c.query, "expected_ids": c.expected_ids} for c in cases])
+    return cases
 
 
 def _print_table(rows: list[SweepRow]) -> None:
-    # Plain ASCII, no rich: the agent parses this as text.
-    print("\nRESULTS (sorted by MRR desc):")
-    print("chunk_size | overlap | alpha |  k | precision | recall |   MRR")
-    print("-----------+---------+-------+----+-----------+--------+------")
+    header = f"{'chunk':>6} {'overlap':>7} {'alpha':>6} {'k':>4} {'prec':>7} {'recall':>7} {'MRR':>7}"
+    print(f"\n{'Sweep Results (sorted by MRR)':^50}")
+    print(header)
+    print("-" * len(header))
+
+    best_mrr = rows[0].metrics.mrr if rows else 0
     for r in rows:
+        mrr_str = f"{r.metrics.mrr:.3f}"
+        if r.metrics.mrr == best_mrr:
+            mrr_str = f"{mrr_str} <-- best"
         print(
-            f"{r.cfg.chunk_size:>10}"
-            f" | {r.cfg.overlap:>7}"
-            f" | {r.cfg.alpha:>5.1f}"
-            f" | {r.cfg.k:>2}"
-            f" | {r.metrics.precision:>9.3f}"
-            f" | {r.metrics.recall:>6.3f}"
-            f" | {r.metrics.mrr:>5.3f}"
+            f"{r.cfg.chunk_size:>6} {r.cfg.overlap:>7.1f} {r.cfg.alpha:>6.1f} {r.cfg.k:>4}"
+            f" {r.metrics.precision:>7.3f} {r.metrics.recall:>7.3f} {mrr_str:>7}"
         )
+    print()
