@@ -26,6 +26,7 @@ venv/
 # Project-local notes
 CLAUDE.md
 .design/
+.research/
 .eval/
 todo.md
 tests/
