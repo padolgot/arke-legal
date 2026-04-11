@@ -98,8 +98,10 @@ class Mneme:
         return await chat(self.cfg, self.http, prompt, query)
 
 
+from .digest import digest as _digest  # noqa: E402
 from .sweep import run_sweep, SweepRow, EvalMetrics, EvalResult  # noqa: E402
 
+Mneme.digest = staticmethod(_digest)
 Mneme.sweep = staticmethod(run_sweep)
 
 __all__ = [

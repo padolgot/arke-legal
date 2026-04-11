@@ -36,7 +36,12 @@ class Cache:
     def load(self) -> list[dict] | None:
         if not self._path.exists():
             return None
-        return [json.loads(line) for line in self._path.read_text().splitlines()]
+        try:
+            return [json.loads(line) for line in self._path.read_text().splitlines()]
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            self._path.unlink(missing_ok=True)
+            print(f"cache corrupt, deleted: {self._path}")
+            return None
 
     def save(self, rows: list[dict]) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)

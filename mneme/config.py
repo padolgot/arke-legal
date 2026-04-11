@@ -3,15 +3,12 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, replace
 
-OLLAMA = "ollama"
-OPENAI = "openai"
-
 
 @dataclass(frozen=True)
 class Config:
     database_url: str = ""
-    provider: str = OLLAMA
-    provider_api_key: str = ""
+    data_path: str = ""
+    api_key: str = ""
     embedder_url: str = ""
     embedder_model: str = ""
     embedding_dim: int = 0
@@ -23,22 +20,17 @@ class Config:
     k: int = 5
 
     def resolved(self) -> Config:
-        """Fills empty provider fields from defaults, validates, returns new Config."""
+        """Fills empty fields from defaults, validates, returns new Config."""
         if not self.database_url:
             raise ValueError("config: database_url is required")
-        if self.provider not in PROVIDER_DEFAULTS:
-            raise ValueError(f"config: unset or unknown provider '{self.provider}'")
-        if self.provider == OPENAI and not self.provider_api_key:
-            raise ValueError("config: provider_api_key is required for openai")
 
-        defaults = PROVIDER_DEFAULTS[self.provider]
         cfg = replace(
             self,
-            embedder_url=self.embedder_url or defaults.embedder_url,
-            embedder_model=self.embedder_model or defaults.embedder_model,
-            embedding_dim=self.embedding_dim or defaults.embedding_dim,
-            inference_url=self.inference_url or defaults.inference_url,
-            inference_model=self.inference_model or defaults.inference_model,
+            embedder_url=self.embedder_url or DEFAULTS.embedder_url,
+            embedder_model=self.embedder_model or DEFAULTS.embedder_model,
+            embedding_dim=self.embedding_dim or DEFAULTS.embedding_dim,
+            inference_url=self.inference_url or DEFAULTS.inference_url,
+            inference_model=self.inference_model or DEFAULTS.inference_model,
         )
 
         if cfg.chunk_size < 100 or cfg.chunk_size > 10000:
@@ -56,24 +48,20 @@ class Config:
     def from_env() -> Config:
         return Config(
             database_url=os.environ.get("DATABASE_URL", ""),
-            provider=os.environ.get("PROVIDER", ""),
-            provider_api_key=os.environ.get("PROVIDER_API_KEY", ""),
+            data_path=os.environ.get("DATA_PATH", ""),
+            api_key=os.environ.get("API_KEY", ""),
+            embedder_url=os.environ.get("EMBEDDER_URL", ""),
+            embedder_model=os.environ.get("EMBEDDER_MODEL", ""),
+            embedding_dim=int(os.environ.get("EMBEDDING_DIM", "0")),
+            inference_url=os.environ.get("INFERENCE_URL", ""),
+            inference_model=os.environ.get("INFERENCE_MODEL", ""),
         )
 
 
-PROVIDER_DEFAULTS = {
-    OLLAMA: Config(
-        embedder_url="http://localhost:11434",
-        embedder_model="bge-m3",
-        embedding_dim=1024,
-        inference_url="http://localhost:11434",
-        inference_model="llama3:8b-instruct-q4_K_M",
-    ),
-    OPENAI: Config(
-        embedder_url="https://api.openai.com",
-        embedder_model="text-embedding-3-small",
-        embedding_dim=1536,
-        inference_url="https://api.openai.com",
-        inference_model="gpt-4.1-nano",
-    ),
-}
+DEFAULTS = Config(
+    embedder_url="http://localhost:11434",
+    embedder_model="bge-m3",
+    embedding_dim=1024,
+    inference_url="http://localhost:11434",
+    inference_model="llama3:8b-instruct-q4_K_M",
+)

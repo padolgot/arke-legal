@@ -5,7 +5,7 @@ from .config import Config
 from .models import embed
 from .types import Chunk, SearchHit
 from .cache import Cache, corpus_hash
-from .corpus import SQUAD_URL, SQUAD_LIMIT, download_squad
+from .digest import digest
 from .gen import make_cases, EvalCase
 from .presets import get_preset
 
@@ -29,8 +29,8 @@ class EvalMetrics:
     mrr: float  # Mean Reciprocal Rank: 1 / position of first correct result
 
 
-async def run_sweep(base_cfg: Config, level: str, limit: int, source_path: str = "") -> list[SweepRow]:
-    source_path = _ensure_corpus(source_path)
+async def run_sweep(base_cfg: Config, level: str, limit: int) -> list[SweepRow]:
+    source_path = digest(base_cfg.data_path)
 
     configs = get_preset(level, base_cfg)
     rows: list[SweepRow] = []
@@ -58,17 +58,6 @@ async def run_sweep(base_cfg: Config, level: str, limit: int, source_path: str =
     rows.sort(key=lambda r: r.metrics.mrr, reverse=True)
     _print_table(rows)
     return rows
-
-
-def _ensure_corpus(source_path: str) -> str:
-    """Returns path to corpus file. Downloads SQuAD if no source provided."""
-    if source_path:
-        return source_path
-
-    cache = Cache(url=SQUAD_URL, limit=SQUAD_LIMIT)
-    if not cache.exists():
-        cache.save(download_squad())
-    return str(cache.path)
 
 
 async def _ensure_chunks(m: Mneme, chash: str, cfg: Config, source_path: str) -> None:

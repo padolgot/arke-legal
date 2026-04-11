@@ -1,14 +1,17 @@
-"""Built-in corpus for eval. Downloads SQuAD so users can run eval without their own data."""
+"""Built-in SQuAD parser. Used by digest when DATA_PATH is a URL."""
 import json
+from urllib.error import URLError
 from urllib.request import urlopen
 
-SQUAD_URL = "https://rajpurkar.github.io/SQuAD-explorer/dataset/dev-v2.0.json"
 SQUAD_LIMIT = 200
 
 
-def download_squad() -> list[dict]:
-    print("downloading SQuAD dev set...")
-    raw = json.loads(urlopen(SQUAD_URL).read())
+def download_squad(url: str) -> list[dict]:
+    print(f"downloading from {url}...")
+    try:
+        raw = json.loads(urlopen(url).read())
+    except (URLError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"failed to download {url}: {exc}") from exc
 
     docs = []
     for article in raw["data"]:

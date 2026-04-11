@@ -1,8 +1,14 @@
+"""LLM API client. Speaks the /v1/ protocol supported by all major backends."""
+import asyncio
+
 import httpx
 
-from .config import Config, OLLAMA, OPENAI
+from .config import Config
 
 EMBED_BATCH_SIZE = 2048
+RETRY_ATTEMPTS = 3
+RETRY_DELAY = 2
+RETRYABLE_STATUSES = (429, 502, 503, 504)
 
 
 async def embed(cfg: Config, http: httpx.AsyncClient, texts: list[str]) -> list[list[float]]:
@@ -16,19 +22,14 @@ async def embed(cfg: Config, http: httpx.AsyncClient, texts: list[str]) -> list[
 
 
 async def _embed_batch(cfg: Config, http: httpx.AsyncClient, texts: list[str]) -> list[list[float]]:
-    if cfg.provider == OPENAI:
-        url = f"{cfg.embedder_url}/v1/embeddings"
-        body = {"model": cfg.embedder_model, "input": texts}
-        res = await _post(http, url, cfg.provider_api_key, body)
+    url = f"{cfg.embedder_url}/v1/embeddings"
+    body = {"model": cfg.embedder_model, "input": texts}
+    res = await _post(http, url, cfg.api_key, body)
+    try:
         data = sorted(res["data"], key=lambda d: d["index"])
         return [d["embedding"] for d in data]
-    elif cfg.provider == OLLAMA:
-        url = f"{cfg.embedder_url}/api/embed"
-        body = {"model": cfg.embedder_model, "input": texts}
-        res = await _post(http, url, "", body)
-        return res["embeddings"]
-    else:
-        raise ValueError(f"unknown provider: {cfg.provider}")
+    except (KeyError, TypeError, IndexError) as exc:
+        raise RuntimeError(f"unexpected embed response from {url}: {exc}") from exc
 
 
 async def chat(cfg: Config, http: httpx.AsyncClient, system: str | None, user: str) -> str:
@@ -37,23 +38,37 @@ async def chat(cfg: Config, http: httpx.AsyncClient, system: str | None, user: s
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": user})
 
-    if cfg.provider == OPENAI:
-        url = f"{cfg.inference_url}/v1/chat/completions"
-        body = {"model": cfg.inference_model, "messages": messages}
-        res = await _post(http, url, cfg.provider_api_key, body)
+    url = f"{cfg.inference_url}/v1/chat/completions"
+    body = {"model": cfg.inference_model, "messages": messages}
+    res = await _post(http, url, cfg.api_key, body)
+    try:
         return res["choices"][0]["message"]["content"]
-    elif cfg.provider == OLLAMA:
-        url = f"{cfg.inference_url}/api/chat"
-        body = {"model": cfg.inference_model, "stream": False, "messages": messages}
-        res = await _post(http, url, "", body)
-        return res["message"]["content"]
-    else:
-        raise ValueError(f"unknown provider: {cfg.provider}")
+    except (KeyError, TypeError, IndexError) as exc:
+        raise RuntimeError(f"unexpected chat response from {url}: {exc}") from exc
 
 
 async def _post(http: httpx.AsyncClient, url: str, api_key: str, body: dict) -> dict:
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-    res = await http.post(url, headers=headers, json=body, timeout=60.0)
-    if res.status_code >= 400:
-        raise RuntimeError(f"API {res.status_code}: {res.text}")
-    return res.json()
+    last_err: Exception | None = None
+
+    for attempt in range(RETRY_ATTEMPTS):
+        try:
+            res = await http.post(url, headers=headers, json=body, timeout=60.0)
+        except (httpx.ConnectError, httpx.TimeoutException) as exc:
+            last_err = exc
+            if attempt < RETRY_ATTEMPTS - 1:
+                await asyncio.sleep(RETRY_DELAY)
+                continue
+            raise RuntimeError(f"API unreachable after {RETRY_ATTEMPTS} attempts ({url}): {exc}") from exc
+
+        if res.status_code in RETRYABLE_STATUSES and attempt < RETRY_ATTEMPTS - 1:
+            last_err = RuntimeError(f"API {res.status_code}")
+            await asyncio.sleep(RETRY_DELAY)
+            continue
+
+        if res.status_code >= 400:
+            raise RuntimeError(f"API {res.status_code} from {url}: {res.text[:200]}")
+
+        return res.json()
+
+    raise RuntimeError(f"API failed after {RETRY_ATTEMPTS} attempts ({url}): {last_err}")

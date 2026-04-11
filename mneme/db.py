@@ -14,12 +14,21 @@ class Db:
         self._embedding_dim = embedding_dim
 
     async def open(self) -> None:
-        self._pool = await asyncpg.create_pool(dsn=self._dsn, init=_init_conn)
+        try:
+            self._pool = await asyncpg.create_pool(dsn=self._dsn, init=_init_conn)
+        except (OSError, asyncpg.PostgresError) as exc:
+            raise RuntimeError(f"database connection failed ({self._dsn}): {exc}") from exc
 
     async def close(self) -> None:
         await self._pool.close()
 
     async def init_schema(self) -> None:
+        try:
+            await self._init_schema()
+        except asyncpg.UndefinedObjectError as exc:
+            raise RuntimeError("pgvector extension is not installed on this PostgreSQL server") from exc
+
+    async def _init_schema(self) -> None:
         async with self._pool.acquire() as conn:
             await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
             await conn.execute(f"""
