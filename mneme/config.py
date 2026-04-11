@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, replace
 
-
 OLLAMA = "ollama"
 OPENAI = "openai"
 
@@ -28,7 +27,7 @@ class Config:
         if not self.database_url:
             raise ValueError("config: database_url is required")
         if self.provider not in PROVIDER_DEFAULTS:
-            raise ValueError(f"config: unknown provider '{self.provider}'")
+            raise ValueError(f"config: unset or unknown provider '{self.provider}'")
         if self.provider == OPENAI and not self.provider_api_key:
             raise ValueError("config: provider_api_key is required for openai")
 
@@ -55,12 +54,9 @@ class Config:
 
     @staticmethod
     def from_env() -> Config:
-        database_url = os.environ.get("DATABASE_URL", "")
-        if not database_url:
-            raise ValueError("DATABASE_URL is not set")
         return Config(
-            database_url=database_url,
-            provider=os.environ.get("PROVIDER", OLLAMA),
+            database_url=os.environ.get("DATABASE_URL", ""),
+            provider=os.environ.get("PROVIDER", ""),
             provider_api_key=os.environ.get("PROVIDER_API_KEY", ""),
         )
 

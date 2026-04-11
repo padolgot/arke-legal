@@ -1,16 +1,11 @@
-import json
-
 import asyncpg
 import pgvector.asyncpg
 
+from .config import Config
 from .types import Chunk, SearchHit
 
 
 BATCH_SIZE = 50
-
-
-def _chunk_to_row(c: Chunk) -> tuple:
-    return (c.id, c.source, c.chunk_index, c.content, c.embedding, json.dumps(c.metadata), c.created_at)
 
 
 class Db:
@@ -43,7 +38,7 @@ class Db:
             await conn.execute(f"CREATE INDEX IF NOT EXISTS chunks_embedding_idx ON chunks USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64)")
 
     async def insert(self, chunks: list[Chunk]) -> None:
-        rows = [_chunk_to_row(c) for c in chunks]
+        rows = [c.to_row() for c in chunks]
         async with self._pool.acquire() as conn:
             async with conn.transaction():
                 for offset in range(0, len(rows), BATCH_SIZE):
@@ -56,7 +51,7 @@ class Db:
                         rows[offset : offset + BATCH_SIZE],
                     )
 
-    async def search(self, query_vec: list[float], query_text: str, alpha: float, k: int) -> list[SearchHit]:
+    async def search(self, cfg: Config, query_vec: list[float], query_text: str) -> list[SearchHit]:
         """Hybrid search: alpha*cosine + (1-alpha)*bm25_normalized."""
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
@@ -76,7 +71,7 @@ class Db:
                 ORDER BY similarity DESC
                 LIMIT $2
                 """,
-                query_vec, k, query_text, alpha,
+                query_vec, cfg.k, query_text, cfg.alpha,
             )
         return [
             SearchHit(chunk=Chunk.from_dict(dict(r)), similarity=float(r["similarity"]))

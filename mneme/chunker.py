@@ -60,8 +60,10 @@ def _merge(splits: list[str], chunk_size: int) -> list[str]:
     for s in splits:
         if not s:
             continue
+
         if raw and len(raw[-1]) + len(s) < chunk_size:
             raw[-1] += s
         else:
             raw.append(s)
+
     return raw

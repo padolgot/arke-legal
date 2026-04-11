@@ -4,8 +4,7 @@ import click
 from dotenv import load_dotenv
 
 from . import Mneme
-from .core.config import Config
-from .eval import Eval
+from .config import Config
 
 
 def _mneme() -> Mneme:
@@ -41,10 +40,9 @@ def ask(query: str) -> None:
 @click.argument("source", default="")
 @click.option("--limit", "-l", default=30, type=int, help="Number of sample chunks for eval")
 def sweep(level: str, source: str, limit: int) -> None:
-    base_cfg = Config.from_env()
-
     async def run() -> None:
-        await Eval(base_cfg).sweep(level, limit, source)
+        cfg = Config.from_env()
+        await Mneme.sweep(cfg, level, limit, source)
     asyncio.run(run())
 
 

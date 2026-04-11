@@ -7,7 +7,6 @@ SQUAD_LIMIT = 200
 
 
 def download_squad() -> list[dict]:
-    """Downloads SQuAD dev set paragraphs."""
     print("downloading SQuAD dev set...")
     raw = json.loads(urlopen(SQUAD_URL).read())
 

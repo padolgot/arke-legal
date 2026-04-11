@@ -2,7 +2,6 @@ import httpx
 
 from .config import Config, OLLAMA, OPENAI
 
-
 EMBED_BATCH_SIZE = 2048
 
 
@@ -10,7 +9,7 @@ async def embed(cfg: Config, http: httpx.AsyncClient, texts: list[str]) -> list[
     """Embeds texts in batches to respect API limits."""
     all_vectors: list[list[float]] = []
     for offset in range(0, len(texts), EMBED_BATCH_SIZE):
-        batch = texts[offset : offset + EMBED_BATCH_SIZE]
+        batch = texts[offset: offset + EMBED_BATCH_SIZE]
         vectors = await _embed_batch(cfg, http, batch)
         all_vectors.extend(vectors)
     return all_vectors

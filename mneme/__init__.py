@@ -4,12 +4,12 @@ import hashlib
 
 import httpx
 
-from .core.chunker import chunk
-from .core.config import Config
-from .core.db import Db
-from .core.loader import load_docs
-from .core.models import chat, embed
-from .core.types import Chunk, SearchHit
+from .chunker import chunk
+from .config import Config
+from .db import Db
+from .loader import load_docs
+from .models import chat, embed
+from .types import Chunk, SearchHit
 
 
 class Mneme:
@@ -21,9 +21,9 @@ class Mneme:
 
     async def open(self) -> None:
         self.db = Db(self.cfg.database_url, self.cfg.embedding_dim)
-        self.http = httpx.AsyncClient(timeout=60.0)
         await self.db.open()
         await self.db.init_schema()
+        self.http = httpx.AsyncClient(timeout=60.0)
 
     async def close(self) -> None:
         await self.db.close()
@@ -42,36 +42,39 @@ class Mneme:
     async def ingest(self, source_path: str) -> None:
         docs = load_docs(source_path)
 
-        all_pieces = []
-        piece_origins = []
-        for doc in docs:
-            pieces = chunk(doc.content, self.cfg.chunk_size, self.cfg.overlap)
-            for i, p in enumerate(pieces):
-                all_pieces.append(p)
-                piece_origins.append((doc, i))
+        class Piece:
+            def __init__(self, doc, idx, raw):
+                self.doc = doc
+                self.idx = idx
+                self.raw = raw
 
-        texts = [p.overlapped() for p in all_pieces]
+        pieces = []
+        for doc in docs:
+            for idx, raw in enumerate(chunk(doc.content, self.cfg.chunk_size, self.cfg.overlap)):
+                pieces.append(Piece(doc, idx, raw))
+
+        texts = [p.raw.overlapped() for p in pieces]
         vectors = await embed(self.cfg, self.http, texts)
         print(f"embedded {len(texts)} chunks in one call")
 
         chunks = [
             Chunk(
-                id=hashlib.md5(f"{doc.source}:{idx}:{p.clean}".encode()).hexdigest(),
-                source=doc.source,
-                chunk_index=idx,
-                content=p.clean,
+                id=hashlib.md5(f"{p.doc.source}:{p.idx}:{p.raw.clean}".encode()).hexdigest(),
+                source=p.doc.source,
+                chunk_index=p.idx,
+                content=p.raw.clean,
                 embedding=vectors[i],
-                metadata=doc.metadata,
-                created_at=doc.created_at,
+                metadata=p.doc.metadata,
+                created_at=p.doc.created_at,
             )
-            for i, (p, (doc, idx)) in enumerate(zip(all_pieces, piece_origins))
+            for i, p in enumerate(pieces)
         ]
         await self.db.insert(chunks)
         print(f"ingest done: {len(chunks)} chunks from {len(docs)} docs")
 
     async def ask(self, query: str) -> str:
         vectors = await embed(self.cfg, self.http, [query])
-        hits = await self.db.search(vectors[0], query, self.cfg.alpha, self.cfg.k)
+        hits = await self.db.search(self.cfg, vectors[0], query)
 
         if hits:
             return await self._answer_with_context(query, hits)
@@ -95,14 +98,14 @@ class Mneme:
         return await chat(self.cfg, self.http, prompt, query)
 
 
-# eval imports go after Mneme class to avoid circular import:
-# eval/sweep.py and eval/gen.py import Mneme from this module
-from .eval import Eval, EvalMetrics, SweepRow  # noqa: E402
+from .sweep import run_sweep, SweepRow, EvalMetrics, EvalResult  # noqa: E402
+
+Mneme.sweep = staticmethod(run_sweep)
 
 __all__ = [
     "Mneme",
     "Config",
-    "Eval",
     "SweepRow",
     "EvalMetrics",
+    "EvalResult",
 ]

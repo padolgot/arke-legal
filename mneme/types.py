@@ -33,6 +33,11 @@ class Chunk:
             "created_at": self.created_at.isoformat(),
         }
 
+    def to_row(self) -> tuple:
+        """Tuple for DB INSERT. Column order must match the INSERT statement in db.py."""
+        return (self.id, self.source, self.chunk_index, self.content,
+                self.embedding, json.dumps(self.metadata), self.created_at)
+
     @staticmethod
     def from_dict(d: dict) -> "Chunk":
         created = d["created_at"]
@@ -57,4 +62,4 @@ class Chunk:
 @dataclass(frozen=True)
 class SearchHit:
     chunk: Chunk
-    similarity: float  # alpha*cosine + (1-alpha)*bm25_normalized
+    similarity: float

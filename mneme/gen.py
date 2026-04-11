@@ -1,12 +1,19 @@
+from dataclasses import dataclass
+
 import asyncio
 import json
 import re
 
-from .. import Mneme
-from ..core.models import chat
-from .metrics import EvalCase
+from . import Mneme
+from .models import chat
 
 CONCURRENCY = 10
+
+
+@dataclass(frozen=True)
+class EvalCase:
+    query: str
+    expected_ids: list[str]
 
 
 async def make_cases(mneme: Mneme, limit: int) -> list[EvalCase]:

@@ -23,12 +23,15 @@ def _load_file(file: Path) -> list[Doc]:
     for line in file.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
+
         try:
             raw = json.loads(line)
         except json.JSONDecodeError:
             continue
+
         if not isinstance(raw, dict):
             continue
+
         content = raw.get("content")
         if not isinstance(content, str) or not content.strip():
             continue
@@ -36,9 +39,8 @@ def _load_file(file: Path) -> list[Doc]:
         source_raw = raw.get("source")
         source = source_raw if isinstance(source_raw, str) and source_raw else fallback
 
-        # "Z" → "+00:00": fromisoformat didn't understand the Z suffix before 3.11.
-        created_at = datetime.now(timezone.utc)
         raw_date = raw.get("created_at")
+        created_at = datetime.now(timezone.utc)
         if isinstance(raw_date, str):
             try:
                 created_at = datetime.fromisoformat(raw_date.replace("Z", "+00:00"))
@@ -49,4 +51,5 @@ def _load_file(file: Path) -> list[Doc]:
         metadata = metadata_raw if isinstance(metadata_raw, dict) else {}
 
         docs.append(Doc(content=content, source=source, created_at=created_at, metadata=metadata))
+
     return docs

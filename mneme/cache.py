@@ -1,10 +1,4 @@
-"""File-based JSONL cache for expensive operations.
-
-Layout:
-    .cache/
-      corpus/squad.jsonl
-      {category}/{hash}.jsonl
-"""
+"""File-based JSONL cache for expensive operations."""
 import hashlib
 import json
 from pathlib import Path
@@ -27,10 +21,10 @@ def corpus_hash(source_path: str) -> str:
 class Cache:
     """Generic JSONL cache. Doesn't know what it stores — just dicts."""
 
-    def __init__(self, category: str, **params: object) -> None:
+    def __init__(self, **params: object) -> None:
         raw = json.dumps(params, sort_keys=True, default=str)
         key = hashlib.md5(raw.encode()).hexdigest()[:16]
-        self._path = CACHE_DIR / category / f"{key}.jsonl"
+        self._path = CACHE_DIR / f"{key}.jsonl"
 
     @property
     def path(self) -> Path:

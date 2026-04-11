@@ -1,13 +1,12 @@
 from dataclasses import dataclass
 
-from .. import Mneme
-from ..core.config import Config
-from ..core.models import embed
-from ..core.types import Chunk
+from . import Mneme
+from .config import Config
+from .models import embed
+from .types import Chunk, SearchHit
 from .cache import Cache, corpus_hash
 from .corpus import SQUAD_URL, SQUAD_LIMIT, download_squad
-from .gen import make_cases
-from .metrics import EvalCase, EvalMetrics, EvalResult, score
+from .gen import make_cases, EvalCase
 from .presets import get_preset
 
 
@@ -15,6 +14,19 @@ from .presets import get_preset
 class SweepRow:
     cfg: Config
     metrics: EvalMetrics
+
+
+@dataclass(frozen=True)
+class EvalResult:
+    hits: list[SearchHit]
+    expected_ids: list[str]
+
+
+@dataclass(frozen=True)
+class EvalMetrics:
+    precision: float
+    recall: float
+    mrr: float  # Mean Reciprocal Rank: 1 / position of first correct result
 
 
 async def run_sweep(base_cfg: Config, level: str, limit: int, source_path: str = "") -> list[SweepRow]:
@@ -27,20 +39,21 @@ async def run_sweep(base_cfg: Config, level: str, limit: int, source_path: str =
     for idx, cfg in enumerate(configs):
         async with Mneme(cfg) as m:
             await m.reset()
-            await _ensure_chunks(m, chash, cfg.chunk_size, cfg.overlap, source_path)
-            cases = await _ensure_cases(m, chash, cfg.chunk_size, cfg.overlap, limit)
+            await _ensure_chunks(m, chash, cfg, source_path)
+            cases = await _ensure_cases(m, chash, cfg, limit)
 
             queries = [c.query for c in cases]
             vectors = await embed(m.cfg, m.http, queries)
 
             results: list[EvalResult] = []
             for i, case in enumerate(cases):
-                hits = await m.db.search(vectors[i], case.query, cfg.alpha, cfg.k)
+                hits = await m.db.search(cfg, vectors[i], case.query)
                 results.append(EvalResult(hits=hits, expected_ids=case.expected_ids))
 
-            metrics = score(results)
+            metrics = _score(results)
             rows.append(SweepRow(cfg=cfg, metrics=metrics))
-            print(f"  eval {idx + 1}/{len(configs)}: chunk={cfg.chunk_size} overlap={cfg.overlap} alpha={cfg.alpha:.1f} k={cfg.k}")
+            print(
+                f"  eval {idx + 1}/{len(configs)}: chunk={cfg.chunk_size} overlap={cfg.overlap} alpha={cfg.alpha:.1f} k={cfg.k}")
 
     rows.sort(key=lambda r: r.metrics.mrr, reverse=True)
     _print_table(rows)
@@ -52,14 +65,14 @@ def _ensure_corpus(source_path: str) -> str:
     if source_path:
         return source_path
 
-    cache = Cache("corpus", url=SQUAD_URL, limit=SQUAD_LIMIT)
+    cache = Cache(url=SQUAD_URL, limit=SQUAD_LIMIT)
     if not cache.exists():
         cache.save(download_squad())
     return str(cache.path)
 
 
-async def _ensure_chunks(m: Mneme, chash: str, chunk_size: int, overlap: float, source_path: str) -> None:
-    cache = Cache("embeddings", corpus=chash, chunk_size=chunk_size, overlap=overlap, model=m.cfg.embedder_model)
+async def _ensure_chunks(m: Mneme, chash: str, cfg: Config, source_path: str) -> None:
+    cache = Cache(corpus=chash, chunk_size=cfg.chunk_size, overlap=cfg.overlap, embedder=cfg.embedder_model)
     cached = cache.load()
     if cached is not None:
         chunks = [Chunk.from_dict(d) for d in cached]
@@ -71,8 +84,8 @@ async def _ensure_chunks(m: Mneme, chash: str, chunk_size: int, overlap: float, 
         cache.save([c.to_dict() for c in chunks])
 
 
-async def _ensure_cases(m: Mneme, chash: str, chunk_size: int, overlap: float, limit: int) -> list[EvalCase]:
-    cache = Cache("cases", corpus=chash, chunk_size=chunk_size, overlap=overlap, model=m.cfg.inference_model)
+async def _ensure_cases(m: Mneme, chash: str, cfg: Config, limit: int) -> list[EvalCase]:
+    cache = Cache(corpus=chash, chunk_size=cfg.chunk_size, overlap=cfg.overlap, inference=cfg.inference_model)
     cached = cache.load()
     if cached is not None:
         cases = [EvalCase(query=c["query"], expected_ids=c["expected_ids"]) for c in cached]
@@ -82,6 +95,32 @@ async def _ensure_cases(m: Mneme, chash: str, chunk_size: int, overlap: float, l
     cases = await make_cases(m, limit)
     cache.save([{"query": c.query, "expected_ids": c.expected_ids} for c in cases])
     return cases
+
+
+def _score(results: list[EvalResult]) -> EvalMetrics:
+    """Averages precision, recall and MRR across eval results."""
+    n = len(results)
+
+    if n == 0:
+        return EvalMetrics(precision=0.0, recall=0.0, mrr=0.0)
+
+    sum_p = 0.0
+    sum_r = 0.0
+    sum_rr = 0.0
+
+    for r in results:
+        expected = set(r.expected_ids)
+        matched = sum(1 for h in r.hits if h.chunk.id in expected)
+
+        sum_p += matched / len(r.hits) if r.hits else 0.0
+        sum_r += matched / len(expected) if expected else 0.0
+
+        for i, h in enumerate(r.hits):
+            if h.chunk.id in expected:
+                sum_rr += 1.0 / (i + 1)
+                break
+
+    return EvalMetrics(precision=sum_p / n, recall=sum_r / n, mrr=sum_rr / n)
 
 
 def _print_table(rows: list[SweepRow]) -> None:

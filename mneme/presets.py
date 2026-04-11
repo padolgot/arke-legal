@@ -1,7 +1,7 @@
 from dataclasses import replace
 from itertools import product
 
-from ..core.config import Config
+from .config import Config
 
 FAST = "fast"
 MEDIUM = "medium"
@@ -34,6 +34,7 @@ def get_preset(level: str, base: Config) -> list[Config]:
             alphas=[0.0, 0.3, 0.5, 0.7, 1.0],
             ks=[5, 10, 20],
         )
+
     raise ValueError(f"unknown sweep level: {level} (expected: {FAST} | {MEDIUM} | {THOROUGH})")
 
 
