@@ -2,7 +2,7 @@
 
 AI document search for legal teams. Privilege-safe, on-premise.
 
-![Dashboard](/.github/dashboard.png)
+![Dashboard](/.github/media/dashboard.png)
 
 Cloud AI breaks attorney-client privilege (*United States v. Heppner*, *Hamid v SSHD*). Arke runs on your server. Your documents never leave your network.
 

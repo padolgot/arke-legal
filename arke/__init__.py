@@ -83,7 +83,7 @@ class Arke:
         return SearchAnswer(answer=answer, hits=hits)
 
     async def _answer_with_context(self, query: str, hits: list[SearchHit]) -> str:
-        prompt = "You are a personal knowledge assistant. You answer questions based ONLY on the provided context. If the context doesn't contain enough information, say so honestly. Answer in the same language as the question. Be concise and direct."
+        prompt = "You are a document search assistant. Answer ONLY from the provided context. Be concise — use bullet points, cite document names. No recommendations, no disclaimers, no suggestions to contact anyone. If the context is insufficient, say what IS available instead."
 
         parts: list[str] = []
         for i, h in enumerate(hits):

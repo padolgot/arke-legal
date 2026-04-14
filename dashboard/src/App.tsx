@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from "react"
 import { Sun, Moon, Search, FileText, FileSearch } from "lucide-react"
+import Markdown from "react-markdown"
 import { ask, openFile, type Source } from "@/lib/api"
 
 interface Message
@@ -134,7 +135,10 @@ export default function App()
                                         : "max-w-full"
                                 }
                             >
-                                <p className="text-sm whitespace-pre-wrap">{m.text}</p>
+                                {m.role === "user"
+                                    ? <p className="text-sm whitespace-pre-wrap">{m.text}</p>
+                                    : <div className="text-sm prose prose-sm dark:prose-invert max-w-none prose-li:marker:text-foreground prose-a:text-foreground"><Markdown>{m.text}</Markdown></div>
+                                }
                                 {m.sources && m.sources.length > 0 && (
                                     <SourceTable sources={m.sources} />
                                 )}
