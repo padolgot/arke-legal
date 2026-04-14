@@ -38,8 +38,8 @@ def ingest(source: str) -> None:
 def ask(query: str) -> None:
     async def run() -> None:
         async with _arke() as m:
-            answer = await m.ask(query)
-            print(f"\n{answer}\n")
+            result = await m.ask(query)
+            print(f"\n{result.answer}\n")
     asyncio.run(run())
 
 

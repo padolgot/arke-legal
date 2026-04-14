@@ -1,27 +1,66 @@
-import { useState } from "react"
-import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell } from "recharts"
-import { Sun, Moon } from "lucide-react"
-import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card"
-import { Button } from "@/components/ui/button"
-import { Badge } from "@/components/ui/badge"
-import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from "@/components/ui/table"
-import { ask, sweep, type SweepRow } from "@/lib/api"
+import { useState, useRef, useEffect, useCallback } from "react"
+import { Sun, Moon, Search, FileText, FileSearch } from "lucide-react"
+import { ask, openFile, type Source } from "@/lib/api"
 
-function mrrColor(v: number): string
+interface Message
 {
-    if (v >= 0.8) return "oklch(0.72 0.19 142)"   // зелёный
-    if (v >= 0.5) return "oklch(0.80 0.18 85)"    // жёлтый
-    return "oklch(0.63 0.24 25)"                    // красный
+    role: "user" | "assistant";
+    text: string;
+    sources?: Source[];
 }
 
-function fmt(v: number): string
+function SourceTable({ sources }: { sources: Source[] })
 {
-    return (v * 100).toFixed(1) + "%"
+    async function handleClick(source: string)
+    {
+        await openFile(source)
+    }
+
+    return (
+        <div className="mt-3 border border-border rounded-md overflow-hidden">
+            {sources.map((s, i) => (
+                <button
+                    key={i}
+                    onClick={() => handleClick(s.source)}
+                    className="w-full text-left px-4 py-3 flex gap-3 items-start hover:bg-accent/50 transition-colors border-b border-border last:border-b-0 cursor-pointer"
+                >
+                    <FileText size={16} className="mt-0.5 shrink-0 text-muted-foreground" />
+                    <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-2">
+                            <span className="font-medium text-sm truncate">{s.source}</span>
+                            <span className="text-xs text-muted-foreground shrink-0">
+                                {(s.similarity * 100).toFixed(1)}%
+                            </span>
+                        </div>
+                        <p className="text-xs text-muted-foreground mt-1 line-clamp-2">{s.content}</p>
+                    </div>
+                </button>
+            ))}
+        </div>
+    )
 }
 
 export default function App()
 {
     const [dark, setDark] = useState(() => document.documentElement.classList.contains("dark"))
+    const [messages, setMessages] = useState<Message[]>([])
+    const [input, setInput] = useState("")
+    const [loading, setLoading] = useState(false)
+    const bottomRef = useRef<HTMLDivElement>(null)
+    const textareaRef = useRef<HTMLTextAreaElement>(null)
+
+    const autoResize = useCallback(() =>
+    {
+        const el = textareaRef.current
+        if (!el) return
+        el.style.height = "auto"
+        el.style.height = el.scrollHeight + "px"
+    }, [])
+
+    useEffect(() =>
+    {
+        bottomRef.current?.scrollIntoView({ behavior: "smooth" })
+    }, [messages])
 
     function toggleTheme()
     {
@@ -31,222 +70,118 @@ export default function App()
         localStorage.setItem("theme", next ? "dark" : "light")
     }
 
-    const [query, setQuery] = useState("")
-    const [answer, setAnswer] = useState("")
-    const [asking, setAsking] = useState(false)
-
-    const [rows, setRows] = useState<SweepRow[]>([])
-    const [sweeping, setSweeping] = useState(false)
-    const [level, setLevel] = useState("fast")
-
-    async function handleAsk()
+    async function handleSend()
     {
-        if (!query.trim()) return
-        setAsking(true)
+        const q = input.trim()
+        if (!q || loading) return
+
+        setInput("")
+        if (textareaRef.current) textareaRef.current.style.height = "auto"
+        setMessages(prev => [...prev, { role: "user", text: q }])
+        setLoading(true)
+
         try
         {
-            const res = await ask(query)
-            setAnswer(res.answer)
+            const res = await ask(q)
+            setMessages(prev => [
+                ...prev,
+                { role: "assistant", text: res.answer, sources: res.sources },
+            ])
         }
         catch (e)
         {
-            setAnswer("error: " + (e instanceof Error ? e.message : String(e)))
+            setMessages(prev => [
+                ...prev,
+                { role: "assistant", text: "Error: " + (e instanceof Error ? e.message : String(e)) },
+            ])
         }
         finally
         {
-            setAsking(false)
+            setLoading(false)
         }
     }
-
-    async function handleSweep()
-    {
-        setSweeping(true)
-        try
-        {
-            const limits: Record<string, number> = { fast: 10, medium: 30, full: 100 }
-            const res = await sweep(level, limits[level] ?? 30)
-            setRows(res.rows)
-        }
-        catch (e)
-        {
-            setRows([])
-            setAnswer("sweep error: " + (e instanceof Error ? e.message : String(e)))
-        }
-        finally
-        {
-            setSweeping(false)
-        }
-    }
-
-    const sorted = [...rows].sort((a, b) => b.mrr - a.mrr)
-    const best = sorted[0]
-    const worst = sorted[sorted.length - 1]
-    const gap = best && worst ? best.mrr - worst.mrr : 0
 
     return (
-        <div className="min-h-screen bg-background text-foreground">
-            <div className="mx-auto max-w-6xl p-6 space-y-6">
-                <div className="flex items-center justify-between">
-                    <h1 className="text-2xl font-bold">Nerva Iris</h1>
-                    <button
-                        onClick={toggleTheme}
-                        className="rounded-md p-2 hover:bg-accent transition-colors"
-                    >
-                        {dark ? <Sun size={20} /> : <Moon size={20} />}
-                    </button>
+        <div className="min-h-screen bg-background text-foreground flex flex-col">
+            {/* Header */}
+            <header className="sticky top-0 z-10 border-b border-border bg-background px-6 py-3 flex items-center justify-between shrink-0">
+                <div className="flex items-center gap-2">
+                    <FileSearch size={20} />
+                    <h1 className="text-lg font-bold">Arke Terminal</h1>
                 </div>
+                <button
+                    onClick={toggleTheme}
+                    className="rounded-md p-2 hover:bg-accent transition-colors"
+                >
+                    {dark ? <Sun size={18} /> : <Moon size={18} />}
+                </button>
+            </header>
 
-                {/* Ask */}
-                <Card>
-                    <CardHeader>
-                        <CardTitle>Ask</CardTitle>
-                    </CardHeader>
-                    <CardContent className="space-y-3">
-                        <div className="flex gap-2">
-                            <input
-                                className="flex-1 rounded-md border border-input bg-background px-3 py-2 text-sm"
-                                placeholder="Ask a question..."
-                                value={query}
-                                onChange={(e) => setQuery(e.target.value)}
-                                onKeyDown={(e) => e.key === "Enter" && handleAsk()}
-                            />
-                            <Button onClick={handleAsk} disabled={asking}>
-                                {asking ? "..." : "Ask"}
-                            </Button>
+            {/* Messages */}
+            <div className="flex-1 overflow-y-auto px-6 py-4">
+                <div className="mx-auto max-w-3xl space-y-4">
+                    {messages.length === 0 && (
+                        <div className="text-center text-muted-foreground mt-32">
+                            <p className="text-lg">Search your documents</p>
                         </div>
-                        {answer && (
-                            <div className="rounded-md border border-border bg-muted p-3 text-sm whitespace-pre-wrap">
-                                {answer}
-                            </div>
-                        )}
-                    </CardContent>
-                </Card>
-
-                {/* Sweep controls */}
-                <Card>
-                    <CardHeader>
-                        <CardTitle>Sweep</CardTitle>
-                    </CardHeader>
-                    <CardContent className="space-y-4">
-                        <div className="flex gap-3 items-center">
-                            <select
-                                className="rounded-md border border-input bg-background px-3 py-2 text-sm"
-                                value={level}
-                                onChange={(e) => setLevel(e.target.value)}
+                    )}
+                    {messages.map((m, i) => (
+                        <div key={i} className={m.role === "user" ? "flex justify-end" : ""}>
+                            <div
+                                className={
+                                    m.role === "user"
+                                        ? "bg-primary text-primary-foreground rounded-2xl rounded-br-sm px-4 py-2 max-w-[80%]"
+                                        : "max-w-full"
+                                }
                             >
-                                <option value="fast">fast</option>
-                                <option value="medium">medium</option>
-                                <option value="full">full</option>
-                            </select>
-                            <Button onClick={handleSweep} disabled={sweeping}>
-                                {sweeping ? "Running..." : "Run Sweep"}
-                            </Button>
+                                <p className="text-sm whitespace-pre-wrap">{m.text}</p>
+                                {m.sources && m.sources.length > 0 && (
+                                    <SourceTable sources={m.sources} />
+                                )}
+                            </div>
                         </div>
+                    ))}
+                    {loading && (
+                        <div className="text-muted-foreground text-sm animate-pulse">
+                            Thinking...
+                        </div>
+                    )}
+                    <div ref={bottomRef} />
+                </div>
+            </div>
 
-                        {/* Summary cards */}
-                        {rows.length > 0 && (
-                            <>
-                                <div className="grid grid-cols-3 gap-3">
-                                    <Card>
-                                        <CardContent className="p-4">
-                                            <div className="text-xs text-muted-foreground">Best MRR</div>
-                                            <div className="text-2xl font-bold" style={{ color: mrrColor(best.mrr) }}>
-                                                {fmt(best.mrr)}
-                                            </div>
-                                            <div className="text-xs text-muted-foreground">
-                                                chunk={best.chunk_size} k={best.k}
-                                            </div>
-                                        </CardContent>
-                                    </Card>
-                                    <Card>
-                                        <CardContent className="p-4">
-                                            <div className="text-xs text-muted-foreground">Worst MRR</div>
-                                            <div className="text-2xl font-bold" style={{ color: mrrColor(worst.mrr) }}>
-                                                {fmt(worst.mrr)}
-                                            </div>
-                                            <div className="text-xs text-muted-foreground">
-                                                chunk={worst.chunk_size} k={worst.k}
-                                            </div>
-                                        </CardContent>
-                                    </Card>
-                                    <Card>
-                                        <CardContent className="p-4">
-                                            <div className="text-xs text-muted-foreground">Gap</div>
-                                            <div className="text-2xl font-bold">{fmt(gap)}</div>
-                                        </CardContent>
-                                    </Card>
-                                </div>
-
-                                {/* Bar chart */}
-                                <div className="h-64">
-                                    <ResponsiveContainer width="100%" height="100%">
-                                        <BarChart data={sorted}>
-                                            <XAxis
-                                                dataKey="chunk_size"
-                                                tick={{ fill: "var(--foreground)", fontSize: 12 }}
-                                                tickFormatter={(v, i) => `${v}/${sorted[i]?.k ?? ""}`}
-                                                label={{ value: "chunk / k", position: "insideBottom", offset: -2, fill: "var(--muted-foreground)", fontSize: 12 }}
-                                            />
-                                            <YAxis
-                                                domain={[0, 1]}
-                                                tick={{ fill: "var(--foreground)", fontSize: 12 }}
-                                                tickFormatter={(v: number) => fmt(v)}
-                                            />
-                                            <Tooltip
-                                                contentStyle={{ backgroundColor: "var(--card)", border: "1px solid var(--border)", color: "var(--foreground)" }}
-                                                formatter={(v) => [fmt(Number(v)), "MRR"]}
-                                                labelFormatter={(_v, payload) =>
-                                                {
-                                                    const d = payload?.[0]?.payload as SweepRow | undefined
-                                                    return d ? `chunk=${d.chunk_size} overlap=${d.overlap} alpha=${d.alpha} k=${d.k}` : ""
-                                                }}
-                                            />
-                                            <Bar dataKey="mrr">
-                                                {sorted.map((row, i) => (
-                                                    <Cell key={i} fill={mrrColor(row.mrr)} />
-                                                ))}
-                                            </Bar>
-                                        </BarChart>
-                                    </ResponsiveContainer>
-                                </div>
-
-                                {/* Table */}
-                                <Table>
-                                    <TableHeader>
-                                        <TableRow>
-                                            <TableHead>Chunk</TableHead>
-                                            <TableHead>Overlap</TableHead>
-                                            <TableHead>Alpha</TableHead>
-                                            <TableHead>K</TableHead>
-                                            <TableHead>Precision</TableHead>
-                                            <TableHead>Recall</TableHead>
-                                            <TableHead>MRR</TableHead>
-                                        </TableRow>
-                                    </TableHeader>
-                                    <TableBody>
-                                        {sorted.map((row, i) => (
-                                            <TableRow key={i}>
-                                                <TableCell>{row.chunk_size}</TableCell>
-                                                <TableCell>{row.overlap}</TableCell>
-                                                <TableCell>{row.alpha}</TableCell>
-                                                <TableCell>{row.k}</TableCell>
-                                                <TableCell>{fmt(row.precision)}</TableCell>
-                                                <TableCell>{fmt(row.recall)}</TableCell>
-                                                <TableCell>
-                                                    <Badge
-                                                        variant={row.mrr >= 0.8 ? "default" : row.mrr >= 0.5 ? "secondary" : "outline"}
-                                                    >
-                                                        {fmt(row.mrr)}
-                                                    </Badge>
-                                                </TableCell>
-                                            </TableRow>
-                                        ))}
-                                    </TableBody>
-                                </Table>
-                            </>
-                        )}
-                    </CardContent>
-                </Card>
+            {/* Input */}
+            <div className="sticky bottom-0 z-10 px-6 py-4 shrink-0">
+                <div className="mx-auto max-w-3xl">
+                    <div className="rounded-3xl bg-muted border border-border dark:border-white/15 overflow-hidden">
+                        <textarea
+                            ref={textareaRef}
+                            rows={1}
+                            className="w-full bg-transparent text-sm focus:outline-none placeholder:text-muted-foreground resize-none leading-6 px-5 pt-4 pb-2 max-h-72 overflow-y-auto"
+                            placeholder="Search your documents..."
+                            value={input}
+                            onChange={(e) => { setInput(e.target.value); autoResize() }}
+                            onKeyDown={(e) =>
+                            {
+                                if (e.key === "Enter" && !e.shiftKey)
+                                {
+                                    e.preventDefault()
+                                    handleSend()
+                                }
+                            }}
+                            disabled={loading}
+                        />
+                        <div className="flex items-center justify-end px-4 pb-3">
+                            <button
+                                onClick={handleSend}
+                                disabled={loading || !input.trim()}
+                                className="rounded-lg bg-primary text-primary-foreground p-2 hover:opacity-90 transition-opacity disabled:opacity-50"
+                            >
+                                <Search size={16} />
+                            </button>
+                        </div>
+                    </div>
+                </div>
             </div>
         </div>
     )

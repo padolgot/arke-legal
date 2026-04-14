@@ -1,32 +1,32 @@
-const BASE = import.meta.env.VITE_MNEME_URL || "http://localhost:8000";
+const BASE = import.meta.env.VITE_API_URL || "http://localhost:8000";
 
-export async function ask(query: string): Promise<{ answer: string }>
+export interface Source
+{
+    source: string;
+    content: string;
+    similarity: number;
+}
+
+export interface AskResponse
+{
+    answer: string;
+    sources: Source[];
+}
+
+export async function ask(query: string): Promise<AskResponse>
 {
     const res = await fetch(`${BASE}/ask`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ query }),
     });
+    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
     return res.json();
 }
 
-export interface SweepRow
+export async function openFile(source: string): Promise<string>
 {
-    chunk_size: number;
-    overlap: number;
-    alpha: number;
-    k: number;
-    precision: number;
-    recall: number;
-    mrr: number;
-}
-
-export async function sweep(level: string, limit: number): Promise<{ rows: SweepRow[] }>
-{
-    const res = await fetch(`${BASE}/sweep`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ level, limit }),
-    });
-    return res.json();
+    const res = await fetch(`${BASE}/open/${encodeURIComponent(source)}`);
+    const data = await res.json();
+    return data.path;
 }

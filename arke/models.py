@@ -5,7 +5,7 @@ import httpx
 
 from .config import Config
 
-EMBED_BATCH_SIZE = 2048
+EMBED_BATCH_SIZE = 64
 RETRY_ATTEMPTS = 3
 RETRY_DELAY = 2
 RETRYABLE_STATUSES = (429, 502, 503, 504)
@@ -14,10 +14,15 @@ RETRYABLE_STATUSES = (429, 502, 503, 504)
 async def embed(cfg: Config, http: httpx.AsyncClient, texts: list[str]) -> list[list[float]]:
     """Embeds texts in batches to respect API limits."""
     all_vectors: list[list[float]] = []
-    for offset in range(0, len(texts), EMBED_BATCH_SIZE):
+    total = len(texts)
+    for offset in range(0, total, EMBED_BATCH_SIZE):
         batch = texts[offset: offset + EMBED_BATCH_SIZE]
         vectors = await _embed_batch(cfg, http, batch)
         all_vectors.extend(vectors)
+        done = min(offset + EMBED_BATCH_SIZE, total)
+        print(f"\r  embed {done}/{total}", end="", flush=True)
+    if total > EMBED_BATCH_SIZE:
+        print()
     return all_vectors
 
 
@@ -53,13 +58,19 @@ async def _post(http: httpx.AsyncClient, url: str, api_key: str, body: dict) -> 
 
     for attempt in range(RETRY_ATTEMPTS):
         try:
-            res = await http.post(url, headers=headers, json=body, timeout=60.0)
-        except (httpx.ConnectError, httpx.TimeoutException) as exc:
+            res = await http.post(url, headers=headers, json=body, timeout=300.0)
+        except httpx.TimeoutException as exc:
             last_err = exc
             if attempt < RETRY_ATTEMPTS - 1:
                 await asyncio.sleep(RETRY_DELAY)
                 continue
-            raise RuntimeError(f"API unreachable after {RETRY_ATTEMPTS} attempts ({url}): {exc}") from exc
+            raise RuntimeError(f"API timed out after {RETRY_ATTEMPTS} attempts ({url})") from exc
+        except httpx.ConnectError as exc:
+            last_err = exc
+            if attempt < RETRY_ATTEMPTS - 1:
+                await asyncio.sleep(RETRY_DELAY)
+                continue
+            raise RuntimeError(f"API unreachable after {RETRY_ATTEMPTS} attempts ({url})") from exc
 
         if res.status_code in RETRYABLE_STATUSES and attempt < RETRY_ATTEMPTS - 1:
             last_err = RuntimeError(f"API {res.status_code}")

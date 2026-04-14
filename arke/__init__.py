@@ -9,7 +9,7 @@ from .config import Config
 from .db import Db
 from .loader import load_docs
 from .models import chat, embed
-from .types import Chunk, SearchHit
+from .types import Chunk, SearchAnswer, SearchHit
 
 
 class Arke:
@@ -72,14 +72,15 @@ class Arke:
         await self.db.insert(chunks)
         print(f"ingest done: {len(chunks)} chunks from {len(docs)} docs")
 
-    async def ask(self, query: str) -> str:
+    async def ask(self, query: str) -> SearchAnswer:
         vectors = await embed(self.cfg, self.http, [query])
         hits = await self.db.search(self.cfg, vectors[0], query)
 
         if hits:
-            return await self._answer_with_context(query, hits)
+            answer = await self._answer_with_context(query, hits)
         else:
-            return await self._answer_without_context(query)
+            answer = await self._answer_without_context(query)
+        return SearchAnswer(answer=answer, hits=hits)
 
     async def _answer_with_context(self, query: str, hits: list[SearchHit]) -> str:
         prompt = "You are a personal knowledge assistant. You answer questions based ONLY on the provided context. If the context doesn't contain enough information, say so honestly. Answer in the same language as the question. Be concise and direct."

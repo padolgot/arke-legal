@@ -1,0 +1,64 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: arke
+      POSTGRES_PASSWORD: arke
+      POSTGRES_DB: arke
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U arke"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  ollama:
+    image: ollama/ollama
+    ports:
+      - "11435:11434"
+    volumes:
+      - ollama:/root/.ollama
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:11434/api/tags || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  ollama-init:
+    image: ollama/ollama
+    depends_on:
+      ollama:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "Pulling embedding model..."
+        OLLAMA_HOST=http://ollama:11434 ollama pull bge-m3
+        echo "Pulling inference model..."
+        OLLAMA_HOST=http://ollama:11434 ollama pull llama3:8b-instruct-q4_K_M
+        echo "Models ready."
+
+  arke:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://arke:arke@postgres:5432/arke
+      DATA_PATH: /data
+      EMBEDDER_URL: http://ollama:11434
+      INFERENCE_URL: http://ollama:11434
+    ports:
+      - "8000:8000"
+    volumes:
+      - arke-data:/data
+
+volumes:
+  pgdata:
+  ollama:
+  arke-data:

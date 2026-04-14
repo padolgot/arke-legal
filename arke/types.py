@@ -63,3 +63,9 @@ class Chunk:
 class SearchHit:
     chunk: Chunk
     similarity: float
+
+
+@dataclass(frozen=True)
+class SearchAnswer:
+    answer: str
+    hits: list[SearchHit]
