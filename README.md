@@ -5,7 +5,7 @@ Local RAG pipeline with built-in evaluation. Postgres + pgvector for hybrid sear
 ## Install
 
 ```bash
-pip install arke
+pip install arke-terminal
 ```
 
 Requires Python 3.12+, Postgres with `pgvector`, and [Ollama](https://ollama.com).
