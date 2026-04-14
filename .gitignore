@@ -23,8 +23,11 @@ venv/
 # Cache
 .cache/
 
-# Node
+# Node / Vite
 node_modules/
+dist/
+dist-ssr/
+*.local
 
 # Project-local notes
 CLAUDE.md

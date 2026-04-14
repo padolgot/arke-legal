@@ -5,7 +5,7 @@ cache file that sweep and ingest can consume. This is the single
 entry point for all data — no silent downloads, no fallbacks.
 """
 from .cache import Cache, corpus_hash
-from .corpus import download_squad
+from .corpus import download_legalbench
 from .loader import load_docs
 from .types import Doc
 
@@ -22,14 +22,8 @@ def digest(data_path: str) -> str:
 
 
 def _digest_url(url: str) -> str:
-    cache = Cache(url=url)
-    if cache.exists():
-        return str(cache.path)
-
-    docs = download_squad(url)
-    cache.save(docs)
-    print(f"digested {len(docs)} docs from URL")
-    return str(cache.path)
+    corpus_path = download_legalbench()
+    return _digest_local(corpus_path)
 
 
 def _digest_local(path: str) -> str:

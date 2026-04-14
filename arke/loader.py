@@ -7,10 +7,17 @@ from .types import Doc
 
 def load_docs(source_path: str) -> list[Doc]:
     path = Path(source_path)
-    files = sorted(path.glob("*.jsonl")) if path.is_dir() else [path]
+    if not path.is_dir():
+        return _load_file(path)
+
+    jsonl_files = sorted(path.glob("*.jsonl"))
+    txt_files = sorted(path.rglob("*.txt"))
+
     docs: list[Doc] = []
-    for file in files:
+    for file in jsonl_files:
         docs.extend(_load_file(file))
+    for file in txt_files:
+        docs.extend(_load_txt(file, path))
     return docs
 
 
@@ -53,3 +60,18 @@ def _load_file(file: Path) -> list[Doc]:
         docs.append(Doc(content=content, source=source, created_at=created_at, metadata=metadata))
 
     return docs
+
+
+def _load_txt(file: Path, root: Path) -> list[Doc]:
+    """Reads a plain text file as a single Doc. Source = relative path from root."""
+    content = file.read_text(encoding="utf-8").strip()
+    if not content:
+        return []
+
+    source = str(file.relative_to(root))
+    return [Doc(
+        content=content,
+        source=source,
+        created_at=datetime.now(timezone.utc),
+        metadata={},
+    )]

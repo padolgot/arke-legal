@@ -42,8 +42,8 @@ wheels = [
 ]
 
 [[package]]
-name = "arke"
-version = "0.1.46"
+name = "arke-terminal"
+version = "0.1.113"
 source = { editable = "." }
 dependencies = [
     { name = "asyncpg" },
