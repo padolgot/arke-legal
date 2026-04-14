@@ -1,28 +1,39 @@
 # Arke Terminal
 
-Local RAG pipeline with built-in evaluation. Postgres + pgvector for hybrid search, Ollama for embeddings and inference.
+AI document search for legal teams. Privilege-safe, on-premise.
 
-## Install
+![Dashboard](/.github/dashboard.png)
+
+Cloud AI breaks attorney-client privilege (*United States v. Heppner*, *Hamid v SSHD*). Arke runs on your server. Your documents never leave your network.
+
+Hybrid search (semantic + keyword) over your documents. Ask questions, get answers with source references. Click a source to open it in your default application.
+
+## Quick start (Docker)
 
 ```bash
-pip install arke-terminal
+docker compose up --build
 ```
+
+Opens dashboard at [localhost:8000](http://localhost:8000). Pulls models automatically on first run.
+
+## Quick start (local)
 
 Requires Python 3.12+, Postgres with `pgvector`, and [Ollama](https://ollama.com).
 
-Copy `.env.example` to `.env` and fill in your values:
-
 ```bash
-cp .env.example .env
+pip install arke-terminal
+cp .env.example .env   # fill in DATABASE_URL and DATA_PATH
+arke ingest ./your-documents
+arke serve
 ```
 
-## Usage
+## CLI
 
 ```bash
-arke digest
-arke ingest <file.jsonl>
-arke ask "query"
-arke sweep <fast|medium|thorough> --limit 30
+arke ingest <path>                       # index documents
+arke ask "query"                         # search from terminal
+arke serve                               # start dashboard + API
+arke sweep <fast|medium|thorough> -l 30  # run eval benchmark
 ```
 
 ## Library
@@ -30,21 +41,24 @@ arke sweep <fast|medium|thorough> --limit 30
 ```python
 from arke import Arke, Config
 
-cfg = Config(database_url="postgresql://...", api_key="sk-...")
+cfg = Config(database_url="postgresql://...", data_path="./docs")
 
-async with Arke(cfg) as m:
-    await m.ingest("./corpus")
-    answer = await m.ask("What is X?")
-
-rows = await Arke.sweep(cfg, "medium", limit=30)
+async with Arke(cfg) as engine:
+    await engine.ingest("./docs")
+    result = await engine.ask("What are the termination clauses?")
+    print(result.answer)
+    for hit in result.hits:
+        print(hit.chunk.source, hit.similarity)
 ```
 
-## Input format
+## Input formats
 
-JSONL, one document per line:
+**Plain text** (.txt) — loaded directly, source = relative path from root.
+
+**JSONL** — one document per line:
 
 ```json
 {"content": "...", "source": "optional", "created_at": "2026-04-01T12:00:00Z", "metadata": {}}
 ```
 
-Only `content` is required. `source` falls back to the file stem, `created_at` to the current time, `metadata` to `{}`.
+Only `content` is required.
