@@ -1,6 +1,6 @@
 [project]
 name = "arke-terminal"
-version = "0.1.111"
+version = "0.1.113"
 description = "Local-first RAG with built-in eval."
 requires-python = ">=3.12"
 license = "MIT"
@@ -34,7 +34,7 @@ dev = [
 ]
 
 [project.urls]
-Repository = "https://github.com/padolgot/arke"
+Repository = "https://github.com/padolgot/arke-terminal"
 
 [project.scripts]
 arke = "arke.cli:main"
