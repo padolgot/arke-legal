@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 
-from . import Mneme
+from . import Arke
 from .config import Config
 from .models import embed
 from .types import Chunk, SearchHit
@@ -37,7 +37,7 @@ async def run_sweep(base_cfg: Config, level: str, limit: int) -> list[SweepRow]:
     chash = corpus_hash(source_path)
 
     for idx, cfg in enumerate(configs):
-        async with Mneme(cfg) as m:
+        async with Arke(cfg) as m:
             await m.reset()
             await _ensure_chunks(m, chash, cfg, source_path)
             cases = await _ensure_cases(m, chash, cfg, limit)
@@ -60,7 +60,7 @@ async def run_sweep(base_cfg: Config, level: str, limit: int) -> list[SweepRow]:
     return rows
 
 
-async def _ensure_chunks(m: Mneme, chash: str, cfg: Config, source_path: str) -> None:
+async def _ensure_chunks(m: Arke, chash: str, cfg: Config, source_path: str) -> None:
     cache = Cache(corpus=chash, chunk_size=cfg.chunk_size, overlap=cfg.overlap, embedder=cfg.embedder_model)
     cached = cache.load()
     if cached is not None:
@@ -73,7 +73,7 @@ async def _ensure_chunks(m: Mneme, chash: str, cfg: Config, source_path: str) ->
         cache.save([c.to_dict() for c in chunks])
 
 
-async def _ensure_cases(m: Mneme, chash: str, cfg: Config, limit: int) -> list[EvalCase]:
+async def _ensure_cases(m: Arke, chash: str, cfg: Config, limit: int) -> list[EvalCase]:
     cache = Cache(corpus=chash, chunk_size=cfg.chunk_size, overlap=cfg.overlap, inference=cfg.inference_model)
     cached = cache.load()
     if cached is not None:

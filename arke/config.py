@@ -23,6 +23,8 @@ class Config:
         """Fills empty fields from defaults, validates, returns new Config."""
         if not self.database_url:
             raise ValueError("config: database_url is required")
+        if not self.data_path:
+            raise ValueError("config: data_path is required — set DATA_PATH in .env")
 
         cfg = replace(
             self,

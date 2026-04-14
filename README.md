@@ -1,39 +1,42 @@
-# Mneme
+# Arke Terminal
 
-Local RAG pipeline with built-in evaluation. Postgres + pgvector for hybrid search, any /v1/-compatible LLM backend for embeddings and inference.
+Local RAG pipeline with built-in evaluation. Postgres + pgvector for hybrid search, Ollama for embeddings and inference.
 
-## Setup
+## Install
 
-Requires Python 3.12+, [uv](https://docs.astral.sh/uv/), Postgres with the `pgvector` extension.
+```bash
+pip install arke
+```
 
-Copy `.env.example` to `.env` and fill in your values, then install:
+Requires Python 3.12+, Postgres with `pgvector`, and [Ollama](https://ollama.com).
+
+Copy `.env.example` to `.env` and fill in your values:
 
 ```bash
 cp .env.example .env
-uv sync
 ```
 
 ## Usage
 
 ```bash
-uv run mneme digest              # parse DATA_PATH source into cache
-uv run mneme ingest <file.jsonl>
-uv run mneme ask "query"
-uv run mneme sweep <fast|medium|thorough> --limit 30
+arke digest
+arke ingest <file.jsonl>
+arke ask "query"
+arke sweep <fast|medium|thorough> --limit 30
 ```
 
 ## Library
 
 ```python
-from mneme import Mneme, Config
+from arke import Arke, Config
 
 cfg = Config(database_url="postgresql://...", api_key="sk-...")
 
-async with Mneme(cfg) as m:
+async with Arke(cfg) as m:
     await m.ingest("./corpus")
     answer = await m.ask("What is X?")
 
-rows = await Mneme.sweep(cfg, "medium", limit=30)
+rows = await Arke.sweep(cfg, "medium", limit=30)
 ```
 
 ## Input format

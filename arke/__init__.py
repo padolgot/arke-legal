@@ -12,9 +12,9 @@ from .models import chat, embed
 from .types import Chunk, SearchHit
 
 
-class Mneme:
-    """RAG engine with built-in eval. Lifecycle: Mneme(cfg) → open() → work → close().
-    Or use `async with Mneme(cfg) as m:` for automatic cleanup."""
+class Arke:
+    """RAG engine with built-in eval. Lifecycle: Arke(cfg) → open() → work → close().
+    Or use `async with Arke(cfg) as m:` for automatic cleanup."""
 
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg.resolved()
@@ -29,7 +29,7 @@ class Mneme:
         await self.db.close()
         await self.http.aclose()
 
-    async def __aenter__(self) -> Mneme:
+    async def __aenter__(self) -> Arke:
         await self.open()
         return self
 
@@ -101,11 +101,11 @@ class Mneme:
 from .digest import digest as _digest  # noqa: E402
 from .sweep import run_sweep, SweepRow, EvalMetrics, EvalResult  # noqa: E402
 
-Mneme.digest = staticmethod(_digest)
-Mneme.sweep = staticmethod(run_sweep)
+Arke.digest = staticmethod(_digest)
+Arke.sweep = staticmethod(run_sweep)
 
 __all__ = [
-    "Mneme",
+    "Arke",
     "Config",
     "SweepRow",
     "EvalMetrics",

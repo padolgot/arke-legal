@@ -23,6 +23,9 @@ venv/
 # Cache
 .cache/
 
+# Node
+node_modules/
+
 # Project-local notes
 CLAUDE.md
 .design/
