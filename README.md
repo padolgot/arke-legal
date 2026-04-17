@@ -2,63 +2,97 @@
 
 AI document search for legal teams. Privilege-safe, on-premise.
 
-![Dashboard](/.github/media/dashboard.png)
-
 Cloud AI breaks attorney-client privilege (*United States v. Heppner*, *Hamid v SSHD*). Arke runs on your server. Your documents never leave your network.
 
-Hybrid search (semantic + keyword) over your documents. Ask questions, get answers with source references. Click a source to open it in your default application.
+---
 
-## Quick start (Docker)
+## How it works
 
-```bash
-docker compose up --build
-```
+Arke is a single Python process with two pipes.
 
-Opens dashboard at [localhost:8000](http://localhost:8000). Pulls models automatically on first run.
+**Vertical pipe — digestion.** Drop documents into `digest/`. Arke detects the change, loads every file (PDF, DOCX, MSG, TXT), chunks and embeds it, keeps everything in memory and on local disk. On the next question, the answers are already there.
 
-## Quick start (local)
+**Horizontal pipe — query.** A question arrives — from email, terminal, or CLI. Arke embeds the query, runs hybrid search (cosine + BM25), passes the top results to the LLM, and returns a cited answer. No round-trips, no external services: the LLM runs in the same process via `llama-cpp-python`.
 
-Requires Python 3.12+, Postgres with `pgvector`, and [Ollama](https://ollama.com).
+The document is a seed on disk (plain JSON) and a tree in memory (chunks, embeddings, full text). The tree is always rebuilt from the seed. Nothing clever lives on disk.
+
+---
+
+## Install
 
 ```bash
 pip install arke-terminal
-cp .env.example .env   # fill in DATABASE_URL and DATA_PATH
-arke ingest ./your-documents
-arke serve
+cp .env.example .env   # fill in model paths or cloud API key
+arke-server            # start the engine
 ```
 
-## CLI
+No Docker. No Postgres. No Ollama daemon.
+
+---
+
+## Interfaces
+
+**Email (Microsoft 365)**
+
+Arke connects to a shared mailbox via Graph API webhooks. A lawyer sends a question to `ask@yourfirm.legal`, Arke replies with an answer and citations. Runs with `arke-mail`.
+
+Requires: Azure AD app registration, `cloudflared` tunnel for the webhook endpoint.
+
+```
+M365_TENANT_ID, M365_CLIENT_ID, M365_CLIENT_SECRET
+M365_MAILBOX, M365_WEBHOOK_URL
+```
+
+**Terminal**
 
 ```bash
-arke ingest <path>                       # index documents
-arke ask "query"                         # search from terminal
-arke serve                               # start dashboard + API
-arke sweep <fast|medium|thorough> -l 30  # run eval benchmark
+arke ask "What are the termination clauses?"
 ```
 
-## Library
+**Eval sweep** — find the best retrieval config (chunk size, overlap, alpha, k) by running MRR benchmarks across presets:
 
-```python
-from arke import Arke, Config
-
-cfg = Config(database_url="postgresql://...", data_path="./docs")
-
-async with Arke(cfg) as engine:
-    await engine.ingest("./docs")
-    result = await engine.ask("What are the termination clauses?")
-    print(result.answer)
-    for hit in result.hits:
-        print(hit.chunk.source, hit.similarity)
+```bash
+python -m arke.eval.sweep --space legalbench --level medium --limit 50
 ```
+
+---
+
+## Backends
+
+| Backend | When to use |
+|---------|-------------|
+| `local` | Production. GPU server, `.gguf` models. Zero external calls. |
+| `cloud` | Eval and development. OpenAI-compatible API. |
+
+```bash
+# local
+BACKEND=local
+EMBED_MODEL_PATH=/models/nomic-embed.gguf
+INFERENCE_MODEL_PATH=/models/mistral.gguf
+
+# cloud
+BACKEND=cloud
+CLOUD_API_KEY=sk-...
+CLOUD_EMBED_MODEL=text-embedding-3-small
+CLOUD_INFERENCE_MODEL=gpt-4o
+```
+
+---
 
 ## Input formats
 
-**Plain text** (.txt) — loaded directly, source = relative path from root.
+PDF, DOCX, MSG (Outlook), TXT, Markdown. Drop files into `digest/`, Arke picks them up automatically.
 
-**JSONL** — one document per line:
+---
 
-```json
-{"content": "...", "source": "optional", "created_at": "2026-04-01T12:00:00Z", "metadata": {}}
-```
+## Configuration
 
-Only `content` is required.
+All via environment variables (`.env`):
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ARKE_SPACE` | `default` | Dataspace name (isolates documents per client) |
+| `CHUNK_SIZE` | `600` | Characters per chunk |
+| `OVERLAP` | `0.0` | Overlap fraction (0–0.5) |
+| `ALPHA` | `0.7` | Blend: 1.0 = pure semantic, 0.0 = pure keyword |
+| `K` | `5` | Top-k results passed to LLM |
