@@ -1,5 +1,5 @@
 # Arke Terminal — Source Dump
-# Generated: 2026-04-17T23:24:54Z
+# Generated: 2026-04-17T23:26:20Z
 
 # ═══════════════════════════════════════════
 # README.md
@@ -2117,7 +2117,7 @@ class SearchAnswer:
 
 [project]
 name = "arke-terminal"
-version = "0.1.163"
+version = "0.1.192"
 description = "Local-first RAG for legal teams."
 requires-python = ">=3.12"
 license = "MIT"
