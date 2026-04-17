@@ -6,8 +6,8 @@ from dataclasses import dataclass, replace
 
 @dataclass(frozen=True)
 class Config:
-    # Dataspace
-    space: str = "default"
+    # Workspace
+    workspace: str = "default"
 
     # Backend: "local" (llama-cpp-python) or "cloud" (OpenAI)
     backend: str = "local"
@@ -57,7 +57,7 @@ class Config:
     @staticmethod
     def from_env() -> Config:
         return Config(
-            space=os.environ.get("ARKE_SPACE", "default"),
+            workspace=os.environ.get("ARKE_WORKSPACE", "default"),
             backend=os.environ.get("BACKEND", "local"),
             embed_model_path=os.environ.get("EMBED_MODEL_PATH", ""),
             inference_model_path=os.environ.get("INFERENCE_MODEL_PATH", ""),

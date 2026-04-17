@@ -4,7 +4,7 @@ Each config row = full arke-server restart with that config.
 Communicates through mailbox like any real client.
 
 Usage:
-    python -m arke.eval.sweep --space legalbench --level medium --limit 50
+    python -m arke.eval.sweep --workspace legalbench --level medium --limit 50
 """
 import os
 import signal
@@ -36,13 +36,13 @@ class SweepRow:
     metrics: EvalMetrics
 
 
-def run(space: str, level: str, limit: int) -> list[SweepRow]:
+def run(workspace: str, level: str, limit: int) -> list[SweepRow]:
     base_cfg = Config.from_env().resolved()
     configs = get_preset(level, base_cfg)
 
     # Generate eval cases using base config (one-time)
     print("generating eval cases...")
-    cases = _generate_cases(space, base_cfg, limit)
+    cases = _generate_cases(workspace, base_cfg, limit)
     if not cases:
         print("error: no eval cases generated", file=sys.stderr)
         sys.exit(1)
@@ -51,7 +51,7 @@ def run(space: str, level: str, limit: int) -> list[SweepRow]:
     rows: list[SweepRow] = []
     for idx, cfg in enumerate(configs):
         print(f"[{idx + 1}/{len(configs)}] chunk={cfg.chunk_size} overlap={cfg.overlap} alpha={cfg.alpha} k={cfg.k}")
-        metrics = _run_row(space, cfg, cases)
+        metrics = _run_row(workspace, cfg, cases)
         rows.append(SweepRow(cfg=cfg, metrics=metrics))
         print(f"  → precision={metrics.precision:.3f} recall={metrics.recall:.3f} MRR={metrics.mrr:.3f}\n")
 
@@ -60,9 +60,9 @@ def run(space: str, level: str, limit: int) -> list[SweepRow]:
     return rows
 
 
-def _generate_cases(space: str, cfg: Config, limit: int) -> list[EvalCase]:
+def _generate_cases(workspace: str, cfg: Config, limit: int) -> list[EvalCase]:
     """Start server, sample chunks, generate questions, stop server."""
-    proc = _start_server(space, cfg)
+    proc = _start_server(workspace, cfg)
     try:
         _wait_ready()
         # ask server to sample chunks for case generation
@@ -83,8 +83,8 @@ def _generate_cases(space: str, cfg: Config, limit: int) -> list[EvalCase]:
         _stop_server(proc)
 
 
-def _run_row(space: str, cfg: Config, cases: list[EvalCase]) -> EvalMetrics:
-    proc = _start_server(space, cfg)
+def _run_row(workspace: str, cfg: Config, cases: list[EvalCase]) -> EvalMetrics:
+    proc = _start_server(workspace, cfg)
     try:
         _wait_ready()
         results = []
@@ -98,10 +98,10 @@ def _run_row(space: str, cfg: Config, cases: list[EvalCase]) -> EvalMetrics:
         _stop_server(proc)
 
 
-def _start_server(space: str, cfg: Config) -> subprocess.Popen:
+def _start_server(workspace: str, cfg: Config) -> subprocess.Popen:
     env = {
         **os.environ,
-        "ARKE_SPACE": space,
+        "ARKE_WORKSPACE": workspace,
         "CHUNK_SIZE": str(cfg.chunk_size),
         "OVERLAP": str(cfg.overlap),
         "ALPHA": str(cfg.alpha),
@@ -179,8 +179,8 @@ def _print_table(rows: list[SweepRow]) -> None:
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--space", required=True)
+    parser.add_argument("--workspace", required=True)
     parser.add_argument("--level", default="medium")
     parser.add_argument("--limit", type=int, default=50)
     args = parser.parse_args()
-    run(args.space, args.level, args.limit)
+    run(args.workspace, args.level, args.limit)

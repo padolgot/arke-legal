@@ -1,6 +1,6 @@
 [project]
-name = "arke-terminal"
-version = "0.1.192"
+name = "arke"
+version = "0.1.193"
 description = "Local-first RAG for legal teams."
 requires-python = ">=3.12"
 license = "MIT"
@@ -34,7 +34,7 @@ dev = [
 ]
 
 [project.urls]
-Repository = "https://github.com/padolgot/arke-terminal"
+Repository = "https://github.com/padolgot/arke"
 
 [project.scripts]
 arke-server  = "arke.server.main:run"

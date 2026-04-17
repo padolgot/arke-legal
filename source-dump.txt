@@ -1,5 +1,5 @@
 # Arke Terminal — Source Dump
-# Generated: 2026-04-17T23:33:36Z
+# Generated: 2026-04-17T23:47:54Z
 
 # ═══════════════════════════════════════════
 # README.md
@@ -871,7 +871,7 @@ Each config row = full arke-server restart with that config.
 Communicates through mailbox like any real client.
 
 Usage:
-    python -m arke.eval.sweep --space legalbench --level medium --limit 50
+    python -m arke.eval.sweep --workspace legalbench --level medium --limit 50
 """
 import os
 import signal
@@ -903,13 +903,13 @@ class SweepRow:
     metrics: EvalMetrics
 
 
-def run(space: str, level: str, limit: int) -> list[SweepRow]:
+def run(workspace: str, level: str, limit: int) -> list[SweepRow]:
     base_cfg = Config.from_env().resolved()
     configs = get_preset(level, base_cfg)
 
     # Generate eval cases using base config (one-time)
     print("generating eval cases...")
-    cases = _generate_cases(space, base_cfg, limit)
+    cases = _generate_cases(workspace, base_cfg, limit)
     if not cases:
         print("error: no eval cases generated", file=sys.stderr)
         sys.exit(1)
@@ -918,7 +918,7 @@ def run(space: str, level: str, limit: int) -> list[SweepRow]:
     rows: list[SweepRow] = []
     for idx, cfg in enumerate(configs):
         print(f"[{idx + 1}/{len(configs)}] chunk={cfg.chunk_size} overlap={cfg.overlap} alpha={cfg.alpha} k={cfg.k}")
-        metrics = _run_row(space, cfg, cases)
+        metrics = _run_row(workspace, cfg, cases)
         rows.append(SweepRow(cfg=cfg, metrics=metrics))
         print(f"  → precision={metrics.precision:.3f} recall={metrics.recall:.3f} MRR={metrics.mrr:.3f}\n")
 
@@ -927,9 +927,9 @@ def run(space: str, level: str, limit: int) -> list[SweepRow]:
     return rows
 
 
-def _generate_cases(space: str, cfg: Config, limit: int) -> list[EvalCase]:
+def _generate_cases(workspace: str, cfg: Config, limit: int) -> list[EvalCase]:
     """Start server, sample chunks, generate questions, stop server."""
-    proc = _start_server(space, cfg)
+    proc = _start_server(workspace, cfg)
     try:
         _wait_ready()
         # ask server to sample chunks for case generation
@@ -950,8 +950,8 @@ def _generate_cases(space: str, cfg: Config, limit: int) -> list[EvalCase]:
         _stop_server(proc)
 
 
-def _run_row(space: str, cfg: Config, cases: list[EvalCase]) -> EvalMetrics:
-    proc = _start_server(space, cfg)
+def _run_row(workspace: str, cfg: Config, cases: list[EvalCase]) -> EvalMetrics:
+    proc = _start_server(workspace, cfg)
     try:
         _wait_ready()
         results = []
@@ -965,10 +965,10 @@ def _run_row(space: str, cfg: Config, cases: list[EvalCase]) -> EvalMetrics:
         _stop_server(proc)
 
 
-def _start_server(space: str, cfg: Config) -> subprocess.Popen:
+def _start_server(workspace: str, cfg: Config) -> subprocess.Popen:
     env = {
         **os.environ,
-        "ARKE_SPACE": space,
+        "ARKE_WORKSPACE": workspace,
         "CHUNK_SIZE": str(cfg.chunk_size),
         "OVERLAP": str(cfg.overlap),
         "ALPHA": str(cfg.alpha),
@@ -1046,11 +1046,11 @@ def _print_table(rows: list[SweepRow]) -> None:
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--space", required=True)
+    parser.add_argument("--workspace", required=True)
     parser.add_argument("--level", default="medium")
     parser.add_argument("--limit", type=int, default=50)
     args = parser.parse_args()
-    run(args.space, args.level, args.limit)
+    run(args.workspace, args.level, args.limit)
 
 # ═══════════════════════════════════════════
 # arke/__init__.py
@@ -1314,8 +1314,8 @@ from dataclasses import dataclass, replace
 
 @dataclass(frozen=True)
 class Config:
-    # Dataspace
-    space: str = "default"
+    # Workspace
+    workspace: str = "default"
 
     # Backend: "local" (llama-cpp-python) or "cloud" (OpenAI)
     backend: str = "local"
@@ -1365,7 +1365,7 @@ class Config:
     @staticmethod
     def from_env() -> Config:
         return Config(
-            space=os.environ.get("ARKE_SPACE", "default"),
+            workspace=os.environ.get("ARKE_WORKSPACE", "default"),
             backend=os.environ.get("BACKEND", "local"),
             embed_model_path=os.environ.get("EMBED_MODEL_PATH", ""),
             inference_model_path=os.environ.get("INFERENCE_MODEL_PATH", ""),
@@ -1494,41 +1494,44 @@ def _load_msg(path: Path) -> str:
 """Inbox/outbox file queue. Arke's only coordination primitive.
 
 Layout:
-    ~/.arke/inbox/<uuid>.json   — incoming request
-    ~/.arke/outbox/<uuid>.json  — response written by Arke
+    ~/.arke/workspaces/<name>/inbox/<uuid>.json   — incoming request
+    ~/.arke/workspaces/<name>/outbox/<uuid>.json  — response written by Arke
 
 Writers drop a file in inbox and poll outbox for the response.
 Arke scans inbox on every tick, processes, writes outbox.
 """
 import json
-import os
 import time
 import uuid
 from pathlib import Path
 
-ARKE_HOME = Path("~/.arke").expanduser()
-INBOX = ARKE_HOME / "inbox"
-OUTBOX = ARKE_HOME / "outbox"
-
 POLL_INTERVAL = 0.1   # seconds between outbox polls
 POLL_TIMEOUT  = 120.0 # max seconds to wait for a response
 
-
-def setup() -> None:
-    INBOX.mkdir(parents=True, exist_ok=True)
-    OUTBOX.mkdir(parents=True, exist_ok=True)
+_inbox:  Path | None = None
+_outbox: Path | None = None
 
 
-def send(request: dict) -> str:
+def setup(inbox: Path, outbox: Path) -> None:
+    global _inbox, _outbox
+    _inbox  = inbox
+    _outbox = outbox
+    _inbox.mkdir(parents=True, exist_ok=True)
+    _outbox.mkdir(parents=True, exist_ok=True)
+
+
+def send(request: dict, workspace_path: Path) -> str:
     """Write a request to inbox. Returns the message id."""
     msg_id = str(uuid.uuid4())
-    _atomic_write(INBOX / f"{msg_id}.json", request)
+    inbox = workspace_path / "inbox"
+    inbox.mkdir(parents=True, exist_ok=True)
+    _atomic_write(inbox / f"{msg_id}.json", request)
     return msg_id
 
 
-def receive(msg_id: str) -> dict | None:
+def receive(msg_id: str, workspace_path: Path) -> dict | None:
     """Poll outbox for a response. Blocks until response arrives or timeout."""
-    path = OUTBOX / f"{msg_id}.json"
+    path = workspace_path / "outbox" / f"{msg_id}.json"
     deadline = time.monotonic() + POLL_TIMEOUT
 
     while time.monotonic() < deadline:
@@ -1543,8 +1546,9 @@ def receive(msg_id: str) -> dict | None:
 
 def drain() -> list[tuple[str, dict]]:
     """Return all pending inbox messages as (msg_id, request) pairs. Removes files."""
+    assert _inbox is not None, "mailbox.setup() not called"
     messages: list[tuple[str, dict]] = []
-    for f in sorted(INBOX.glob("*.json")):
+    for f in sorted(_inbox.glob("*.json")):
         try:
             data = json.loads(f.read_text())
             messages.append((f.stem, data))
@@ -1556,7 +1560,8 @@ def drain() -> list[tuple[str, dict]]:
 
 def reply(msg_id: str, response: dict) -> None:
     """Write a response to outbox."""
-    _atomic_write(OUTBOX / f"{msg_id}.json", response)
+    assert _outbox is not None, "mailbox.setup() not called"
+    _atomic_write(_outbox / f"{msg_id}.json", response)
 
 
 def _atomic_write(path: Path, data: dict) -> None:
@@ -1572,7 +1577,7 @@ def _atomic_write(path: Path, data: dict) -> None:
 """Arke — the living organism.
 
 Startup sequence:
-  1. mount space (sdb)
+  1. mount workspace (sdb)
   2. load config + models
   3. consume digest/ if present
   4. enter main loop
@@ -1592,7 +1597,7 @@ from . import chunker, loader, mailbox, sdb
 from .bm25 import BM25Index
 from .config import Config
 from .models import Models
-from .space import mount as mount_space
+from .workspace import mount as mount_workspace
 from .types import Chunk, Doc, SearchHit
 
 logger = logging.getLogger(__name__)
@@ -1607,12 +1612,12 @@ SYSTEM_PROMPT = (
 
 
 def run() -> None:
-    mailbox.setup()
     cfg = Config.from_env().resolved()
-    space = mount_space(cfg.space)
+    ws = mount_workspace(cfg.workspace)
+    mailbox.setup(ws.inbox, ws.outbox)
     models = Models.load(cfg)
 
-    digest_path = space.path / "digest"
+    digest_path = ws.path / "digest"
     docs: dict[str, Doc] = {}
     bm25 = BM25Index()
     last_digest_hash = ""
@@ -1621,7 +1626,7 @@ def run() -> None:
         logger.info("loading digest on startup...")
         last_digest_hash = _ingest(digest_path, cfg, models, docs, bm25)
 
-    logger.info("arke ready — %d docs, %d chunks", len(docs), _chunk_count(docs))
+    logger.info("arke ready [%s] — %d docs, %d chunks", ws.name, len(docs), _chunk_count(docs))
 
     while True:
         _drain(docs, bm25, cfg, models)
@@ -1986,60 +1991,6 @@ def wipe(table: str) -> None:
         shutil.rmtree(table_dir)
 
 # ═══════════════════════════════════════════
-# arke/server/space.py
-# ═══════════════════════════════════════════
-
-"""Space — an isolated container for all Arke state.
-
-Each space has its own sdb root and its own config. Switching spaces
-is just calling mount() with a different name — the old in-memory
-objects become invalid, the new space's disk state takes over.
-
-Layout:
-    <home>/<name>/
-        config.json    — chunk params, model, source_dirs
-        data/          — sdb root (documents, chunks, embeddings, sessions)
-"""
-from __future__ import annotations
-
-import shutil
-from dataclasses import dataclass
-from pathlib import Path
-
-from . import sdb
-
-ARKE_HOME = Path("~/.arke")
-
-
-@dataclass(frozen=True)
-class Space:
-    name: str
-    path: Path
-
-    @property
-    def data(self) -> Path:
-        return self.path / "data"
-
-    @property
-    def config_path(self) -> Path:
-        return self.path / "config.json"
-
-    def wipe(self) -> None:
-        """Erase all indexed data. Config is preserved."""
-        if self.data.exists():
-            shutil.rmtree(self.data)
-        sdb.mount(self.data)
-
-
-def mount(name: str, home: str | Path = ARKE_HOME) -> Space:
-    """Mount a space by name. Sets the sdb root. Config is loaded separately."""
-    path = Path(home).expanduser() / "dataspaces" / name
-    path.mkdir(parents=True, exist_ok=True)
-    space = Space(name=name, path=path)
-    sdb.mount(space.data)
-    return space
-
-# ═══════════════════════════════════════════
 # arke/server/types.py
 # ═══════════════════════════════════════════
 
@@ -2146,11 +2097,70 @@ class SearchAnswer:
     hits: list[SearchHit]
 
 # ═══════════════════════════════════════════
+# arke/server/workspace.py
+# ═══════════════════════════════════════════
+
+"""Workspace — an isolated container for all Arke state.
+
+Each workspace has its own sdb root. Switching workspaces is just
+calling mount() with a different name.
+
+Layout:
+    ~/.arke/workspaces/<name>/
+        data/      — sdb root (documents, embeddings, sources)
+        digest/    — drop documents here; Arke ingests on change
+        inbox/     — incoming requests
+        outbox/    — responses
+"""
+from __future__ import annotations
+
+import shutil
+from dataclasses import dataclass
+from pathlib import Path
+
+from . import sdb
+
+ARKE_HOME = Path("~/.arke")
+
+
+@dataclass(frozen=True)
+class Workspace:
+    name: str
+    path: Path
+
+    @property
+    def data(self) -> Path:
+        return self.path / "data"
+
+    @property
+    def inbox(self) -> Path:
+        return self.path / "inbox"
+
+    @property
+    def outbox(self) -> Path:
+        return self.path / "outbox"
+
+    def wipe(self) -> None:
+        """Erase all indexed data."""
+        if self.data.exists():
+            shutil.rmtree(self.data)
+        sdb.mount(self.data)
+
+
+def mount(name: str, home: str | Path = ARKE_HOME) -> Workspace:
+    """Mount a workspace by name. Sets the sdb root."""
+    path = Path(home).expanduser() / "workspaces" / name
+    path.mkdir(parents=True, exist_ok=True)
+    ws = Workspace(name=name, path=path)
+    sdb.mount(ws.data)
+    return ws
+
+# ═══════════════════════════════════════════
 # pyproject.toml
 # ═══════════════════════════════════════════
 
 [project]
-name = "arke-terminal"
+name = "arke"
 version = "0.1.192"
 description = "Local-first RAG for legal teams."
 requires-python = ">=3.12"
@@ -2185,7 +2195,7 @@ dev = [
 ]
 
 [project.urls]
-Repository = "https://github.com/padolgot/arke-terminal"
+Repository = "https://github.com/padolgot/arke"
 
 [project.scripts]
 arke-server  = "arke.server.main:run"

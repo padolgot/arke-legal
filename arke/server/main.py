@@ -1,7 +1,7 @@
 """Arke — the living organism.
 
 Startup sequence:
-  1. mount space (sdb)
+  1. mount workspace (sdb)
   2. load config + models
   3. consume digest/ if present
   4. enter main loop
@@ -21,7 +21,7 @@ from . import chunker, loader, mailbox, sdb
 from .bm25 import BM25Index
 from .config import Config
 from .models import Models
-from .space import mount as mount_space
+from .workspace import mount as mount_workspace
 from .types import Chunk, Doc, SearchHit
 
 logger = logging.getLogger(__name__)
@@ -36,12 +36,12 @@ SYSTEM_PROMPT = (
 
 
 def run() -> None:
-    mailbox.setup()
     cfg = Config.from_env().resolved()
-    space = mount_space(cfg.space)
+    ws = mount_workspace(cfg.workspace)
+    mailbox.setup(ws.inbox, ws.outbox)
     models = Models.load(cfg)
 
-    digest_path = space.path / "digest"
+    digest_path = ws.path / "digest"
     docs: dict[str, Doc] = {}
     bm25 = BM25Index()
     last_digest_hash = ""
@@ -50,7 +50,7 @@ def run() -> None:
         logger.info("loading digest on startup...")
         last_digest_hash = _ingest(digest_path, cfg, models, docs, bm25)
 
-    logger.info("arke ready — %d docs, %d chunks", len(docs), _chunk_count(docs))
+    logger.info("arke ready [%s] — %d docs, %d chunks", ws.name, len(docs), _chunk_count(docs))
 
     while True:
         _drain(docs, bm25, cfg, models)
