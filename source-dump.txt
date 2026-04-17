@@ -1,5 +1,5 @@
 # Arke Terminal — Source Dump
-# Generated: 2026-04-16T17:42:36Z
+# Generated: 2026-04-17T23:24:54Z
 
 # ═══════════════════════════════════════════
 # README.md
@@ -72,180 +72,1130 @@ Only `content` is required.
 
 
 # ═══════════════════════════════════════════
-# arke/api.py
+# arke/clients/cli.py
 # ═══════════════════════════════════════════
 
-"""REST API for Arke. Start with `arke serve`."""
-from contextlib import asynccontextmanager
+"""CLI client. Usage: arke ask "your question" """
+import sys
+
+from arke.server import mailbox
+
+
+def ask(query: str) -> None:
+    msg_id = mailbox.send({"cmd": "ask", "query": query})
+    response = mailbox.receive(msg_id)
+
+    if response is None:
+        print("error: arke did not respond", file=sys.stderr)
+        sys.exit(1)
+
+    if not response.get("ok"):
+        print(f"error: {response.get('error')}", file=sys.stderr)
+        sys.exit(1)
+
+    print(response["answer"])
+
+    for cite in response.get("citations", []):
+        print(f"  [{cite['source']}] {cite['text'][:80]}...")
+
+
+def main() -> None:
+    if len(sys.argv) < 3 or sys.argv[1] != "ask":
+        print("usage: arke ask <query>")
+        sys.exit(1)
+
+    ask(" ".join(sys.argv[2:]))
+
+# ═══════════════════════════════════════════
+# arke/clients/email.py
+# ═══════════════════════════════════════════
+
+"""Email client via Microsoft Graph webhooks.
+
+Steps covered: auth with Azure AD client credentials, Graph subscription
+against the shared mailbox, echo reply to any new email. Arke RAG is wired
+separately through arke.server.mailbox.
+
+Setup (two terminals):
+    $ cloudflared tunnel --url http://localhost:8080
+    # copy the printed https://<slug>.trycloudflare.com URL into
+    # M365_WEBHOOK_URL in .env, then:
+    $ arke-mail
+
+The webhook server runs on a daemon thread so Graph can validate the
+URL synchronously during subscription creation (Graph holds the POST
+open until our endpoint echoes back the validationToken). Everything
+else — subscription lifecycle, renewal, shutdown — lives in the main
+thread as a plain synchronous loop.
+"""
+
+import json
+import logging
+import os
+import secrets
+import signal
+import threading
+import time
+from collections import deque
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import parse_qs, urlparse
+
+import httpx
+import msal
+
+logger = logging.getLogger(__name__)
+
+GRAPH = "https://graph.microsoft.com/v1.0"
+SCOPE = ["https://graph.microsoft.com/.default"]
+SUBSCRIPTION_TTL_MIN = 60
+RENEWAL_INTERVAL_SEC = 50 * 60
+
+
+@dataclass(frozen=True)
+class EmailConfig:
+    tenant_id: str
+    client_id: str
+    client_secret: str
+    mailbox: str
+    webhook_url: str
+    webhook_port: int = 8080
+
+    @staticmethod
+    def from_env() -> "EmailConfig":
+        def req(key: str) -> str:
+            value = os.environ.get(key, "")
+            if not value:
+                raise ValueError(f"email config: {key} is required")
+            return value
+
+        return EmailConfig(
+            tenant_id=req("M365_TENANT_ID"),
+            client_id=req("M365_CLIENT_ID"),
+            client_secret=req("M365_CLIENT_SECRET"),
+            mailbox=req("M365_MAILBOX"),
+            webhook_url=req("M365_WEBHOOK_URL"),
+            webhook_port=int(os.environ.get("M365_WEBHOOK_PORT", "8080")),
+        )
+
+
+class _SeenIds:
+    """Bounded FIFO of recently-processed message IDs. Graph occasionally
+    redelivers a notification (e.g. on our 5xx or a transient network error);
+    without dedup we would reply twice to the same email. Safe without a lock:
+    HTTPServer serves one request at a time."""
+
+    def __init__(self, max_size: int = 512) -> None:
+        self._order: deque[str] = deque(maxlen=max_size)
+        self._set: set[str] = set()
+
+    def check_and_add(self, item: str) -> bool:
+        """Return True if already seen; otherwise record and return False."""
+        if item in self._set:
+            return True
+        if len(self._order) == self._order.maxlen:
+            self._set.discard(self._order[0])
+        self._order.append(item)
+        self._set.add(item)
+        return False
+
+
+def _auth(token: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {token}"}
+
+
+def _iso_utc(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _send(call: Callable[[], httpx.Response], max_tries: int = 3) -> httpx.Response:
+    """Invoke a Graph request with retries on 429 and 5xx, exponential backoff.
+
+    401 is not retried — MSAL caches a valid token, so a rejection means a
+    deeper auth problem that should surface, not be masked.
+    """
+    delay = 1.0
+    for attempt in range(max_tries):
+        r = call()
+        last_attempt = attempt == max_tries - 1
+        if r.status_code == 429 and not last_attempt:
+            time.sleep(float(r.headers.get("Retry-After", delay)))
+            delay *= 2
+            continue
+        if 500 <= r.status_code < 600 and not last_attempt:
+            time.sleep(delay)
+            delay *= 2
+            continue
+        return r
+    return r
+
+
+def acquire_token(app: msal.ConfidentialClientApplication) -> str:
+    result = app.acquire_token_for_client(scopes=SCOPE)
+    if "access_token" not in result:
+        raise RuntimeError(f"auth: {result.get('error_description', result)}")
+    return result["access_token"]
+
+
+def create_subscription(http: httpx.Client, token: str, cfg: EmailConfig, client_state: str) -> str:
+    # Scope to the Inbox folder so outbound replies (saved in Sent Items) do
+    # not trigger notifications. Without this the bot receives its own sent
+    # messages and can recursively reply to itself.
+    expires = datetime.now(timezone.utc) + timedelta(minutes=SUBSCRIPTION_TTL_MIN)
+    body = {
+        "changeType": "created",
+        "notificationUrl": cfg.webhook_url,
+        "resource": f"/users/{cfg.mailbox}/mailFolders('inbox')/messages",
+        "expirationDateTime": _iso_utc(expires),
+        "clientState": client_state,
+    }
+    r = _send(lambda: http.post(f"{GRAPH}/subscriptions", json=body, headers=_auth(token)))
+    r.raise_for_status()
+    return r.json()["id"]
+
+
+def renew_subscription(http: httpx.Client, token: str, sub_id: str) -> None:
+    expires = datetime.now(timezone.utc) + timedelta(minutes=SUBSCRIPTION_TTL_MIN)
+    body = {"expirationDateTime": _iso_utc(expires)}
+    url = f"{GRAPH}/subscriptions/{sub_id}"
+    r = _send(lambda: http.patch(url, json=body, headers=_auth(token)))
+    r.raise_for_status()
+
+
+def delete_subscription(http: httpx.Client, token: str, sub_id: str) -> None:
+    url = f"{GRAPH}/subscriptions/{sub_id}"
+    r = _send(lambda: http.delete(url, headers=_auth(token)))
+    if r.status_code >= 400:
+        logger.warning("delete subscription %s: %d", sub_id, r.status_code)
+
+
+def fetch_message(http: httpx.Client, token: str, mailbox: str, msg_id: str) -> dict:
+    url = f"{GRAPH}/users/{mailbox}/messages/{msg_id}"
+    params = {"$select": "id,subject,from"}
+    r = _send(lambda: http.get(url, params=params, headers=_auth(token)))
+    r.raise_for_status()
+    return r.json()
+
+
+def reply_to_message(http: httpx.Client, token: str, mailbox: str, msg_id: str, comment: str) -> None:
+    url = f"{GRAPH}/users/{mailbox}/messages/{msg_id}/reply"
+    body = {"comment": comment}
+    r = _send(lambda: http.post(url, json=body, headers=_auth(token)))
+    r.raise_for_status()
+
+
+def mark_as_read(http: httpx.Client, token: str, mailbox: str, msg_id: str) -> None:
+    url = f"{GRAPH}/users/{mailbox}/messages/{msg_id}"
+    body = {"isRead": True}
+    r = _send(lambda: http.patch(url, json=body, headers=_auth(token)))
+    r.raise_for_status()
+
+
+def process_message(http: httpx.Client, token: str, mailbox: str, msg_id: str) -> None:
+    """Echo: fetch the message, reply with 'received: <subject>', mark read.
+
+    RAG integration replaces the reply body and optionally routes through
+    arke.server.mailbox; wiring lives outside this function.
+    """
+    msg = fetch_message(http, token, mailbox, msg_id)
+    subject = msg.get("subject") or "(no subject)"
+    sender = (msg.get("from") or {}).get("emailAddress", {}).get("address", "unknown")
+    logger.info("received: %s (from %s)", subject, sender)
+
+    reply_to_message(http, token, mailbox, msg_id, f"received: {subject}")
+    mark_as_read(http, token, mailbox, msg_id)
+
+
+def _build_handler(
+    http: httpx.Client,
+    msal_app: msal.ConfidentialClientApplication,
+    cfg: EmailConfig,
+    client_state: str,
+) -> type[BaseHTTPRequestHandler]:
+    seen = _SeenIds()
+
+    class WebhookHandler(BaseHTTPRequestHandler):
+        def log_message(self, fmt: str, *args: object) -> None:
+            logger.debug("http: " + fmt, *args)
+
+        def do_POST(self) -> None:
+            query = parse_qs(urlparse(self.path).query)
+            if "validationToken" in query:
+                token_value = query["validationToken"][0]
+                payload = token_value.encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                logger.info("subscription validated")
+                return
+
+            length = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(length)
+            self.send_response(202)
+            self.end_headers()
+
+            try:
+                body = json.loads(raw)
+            except json.JSONDecodeError:
+                logger.warning("invalid json body")
+                return
+
+            token = acquire_token(msal_app)
+            for notif in body.get("value", []):
+                if notif.get("clientState") != client_state:
+                    logger.warning("clientState mismatch, dropping")
+                    continue
+                msg_id = (notif.get("resourceData") or {}).get("id")
+                if not msg_id:
+                    continue
+                if seen.check_and_add(msg_id):
+                    logger.info("duplicate notification for %s, skipping", msg_id)
+                    continue
+                try:
+                    process_message(http, token, cfg.mailbox, msg_id)
+                except httpx.HTTPError as exc:
+                    logger.error("process %s failed: %s", msg_id, exc)
+
+    return WebhookHandler
+
+
+def _install_term_handler() -> None:
+    """Translate SIGTERM into KeyboardInterrupt so systemd/docker stop paths run
+    the same finally block as Ctrl-C, deleting the Graph subscription cleanly.
+    Python's default SIGTERM kills the process mid-stride, skipping cleanup."""
+
+    def handler(signum: int, frame: object) -> None:
+        raise KeyboardInterrupt()
+
+    signal.signal(signal.SIGTERM, handler)
+
+
+def run(cfg: EmailConfig) -> None:
+    logger.info("email client starting, mailbox=%s, webhook=%s", cfg.mailbox, cfg.webhook_url)
+    _install_term_handler()
+
+    msal_app = msal.ConfidentialClientApplication(
+        client_id=cfg.client_id,
+        client_credential=cfg.client_secret,
+        authority=f"https://login.microsoftonline.com/{cfg.tenant_id}",
+    )
+
+    with httpx.Client(timeout=30) as http:
+        client_state = secrets.token_urlsafe(32)
+        handler_cls = _build_handler(http, msal_app, cfg, client_state)
+        server = HTTPServer(("127.0.0.1", cfg.webhook_port), handler_cls)
+
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        logger.info("listening on 127.0.0.1:%d", cfg.webhook_port)
+
+        sub_id: str | None = None
+        try:
+            token = acquire_token(msal_app)
+            sub_id = create_subscription(http, token, cfg, client_state)
+            logger.info("created subscription %s", sub_id)
+
+            while True:
+                time.sleep(RENEWAL_INTERVAL_SEC)
+                renew_subscription(http, acquire_token(msal_app), sub_id)
+                logger.info("renewed subscription")
+        except KeyboardInterrupt:
+            logger.info("shutting down")
+        finally:
+            if sub_id is not None:
+                try:
+                    delete_subscription(http, acquire_token(msal_app), sub_id)
+                except Exception:
+                    logger.exception("cleanup failed")
+            server.shutdown()
+
+
+def main() -> None:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    run(EmailConfig.from_env())
+
+
+if __name__ == "__main__":
+    main()
+
+# ═══════════════════════════════════════════
+# arke/clients/__init__.py
+# ═══════════════════════════════════════════
+
+
+# ═══════════════════════════════════════════
+# arke/clients/socket.py
+# ═══════════════════════════════════════════
+
+"""Unix socket gateway. Knows nothing about Arke internals.
+
+Accepts a connection, reads a JSON request, drops it in inbox,
+polls outbox for the response, sends it back, closes the connection.
+"""
+import json
+import logging
+import socket
 from pathlib import Path
 
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from arke.server import mailbox
 
-from . import Arke
-from .config import Config
+logger = logging.getLogger(__name__)
 
-STATIC_DIR = Path(__file__).parent / "static"
+SOCK_PATH = Path("~/.arke/arke.sock").expanduser()
 
 
-engine: Arke
-cfg: Config
+def run(sock_path: Path = SOCK_PATH) -> None:
+    """Start socket gateway. Blocks forever — run in a dedicated thread or process."""
+    mailbox.setup()
+
+    if sock_path.exists():
+        sock_path.unlink()
+
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(sock_path))
+    server.listen()
+    logger.info("gateway listening on %s", sock_path)
+
+    try:
+        while True:
+            conn, _ = server.accept()
+            conn.settimeout(30)
+            try:
+                _handle(conn)
+            except Exception as e:
+                logger.warning("connection error: %s", e)
+            finally:
+                conn.close()
+    finally:
+        server.close()
+        if sock_path.exists():
+            sock_path.unlink()
 
 
-@asynccontextmanager
-async def lifespan(_app: FastAPI):
-    global engine, cfg
-    cfg = Config.from_env()
-    engine = Arke(cfg)
-    await engine.open()
-    yield
-    await engine.close()
+def _handle(conn: socket.socket) -> None:
+    f = conn.makefile("rb")
+    line = f.readline()
+    if not line:
+        return
+
+    try:
+        request = json.loads(line)
+    except json.JSONDecodeError as e:
+        _send(conn, {"ok": False, "error": f"invalid JSON: {e}"})
+        return
+
+    logger.info("cmd=%s", request.get("cmd"))
+
+    msg_id = mailbox.send(request)
+    response = mailbox.receive(msg_id)
+
+    if response is None:
+        _send(conn, {"ok": False, "error": "arke did not respond in time"})
+        return
+
+    _send(conn, response)
 
 
-app = FastAPI(title="Arke", lifespan=lifespan)
+def _send(conn: socket.socket, data: dict) -> None:
+    conn.sendall(json.dumps(data).encode() + b"\n")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+# ═══════════════════════════════════════════
+# arke/clients/tui.py
+# ═══════════════════════════════════════════
+
+"""TUI client. Run: python -m arke.clients.tui"""
+# TODO: replace with Textual when we wire up the UI
+# For now: minimal readline loop so we can test mailbox end-to-end
+
+import sys
+
+from arke.server import mailbox
+
+
+def run() -> None:
+    print("Arke TUI — type your question, Ctrl-C to exit\n")
+
+    while True:
+        try:
+            query = input("> ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            break
+
+        if not query:
+            continue
+
+        msg_id = mailbox.send({"cmd": "ask", "query": query})
+        response = mailbox.receive(msg_id)
+
+        if response is None:
+            print("error: arke did not respond\n")
+            continue
+
+        if not response.get("ok"):
+            print(f"error: {response.get('error')}\n")
+            continue
+
+        print(f"\n{response['answer']}\n")
+
+        for cite in response.get("citations", []):
+            print(f"  [{cite['source']}] {cite['text'][:80]}...")
+        print()
+
+
+if __name__ == "__main__":
+    run()
+
+# ═══════════════════════════════════════════
+# arke/digest/__init__.py
+# ═══════════════════════════════════════════
+
+from .sync import RcloneSource, run
+
+__all__ = ["RcloneSource", "run"]
+
+# ═══════════════════════════════════════════
+# arke/digest/sync.py
+# ═══════════════════════════════════════════
+
+import hashlib
+import logging
+import shutil
+import subprocess
+import time
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+
+class RcloneSource:
+    def __init__(self, name: str, remote: str):
+        self._name = name
+        self._remote = remote
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    def sync_to(self, dest: Path) -> None:
+        dest.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            ["rclone", "sync", self._remote, str(dest),
+             "--timeout", "10m",
+             "--contimeout", "60s"],
+            check=True,
+        )
+
+
+def _dir_hash(path: Path) -> str:
+    h = hashlib.md5()
+    for f in sorted(path.rglob("*")):
+        if f.is_file():
+            st = f.stat()
+            h.update(str(f.relative_to(path)).encode())
+            h.update(str(st.st_size).encode())
+            h.update(str(st.st_mtime_ns).encode())
+    return h.hexdigest()
+
+
+def _load_hash(space: Path) -> str:
+    p = space / ".sync_hash"
+    return p.read_text().strip() if p.exists() else ""
+
+
+def _save_hash(space: Path, h: str) -> None:
+    (space / ".sync_hash").write_text(h)
+
+
+def run(space: Path, sources: list[RcloneSource], interval: int = 60) -> None:
+    """Sync loop. Blocks forever — call from a dedicated process."""
+    staging = space / "staging"
+    digest = space / "digest"
+    staging.mkdir(parents=True, exist_ok=True)
+
+    # survive restarts without forcing a full re-ingest
+    last_hash = _load_hash(space)
+
+    while True:
+        for source in sources:
+            try:
+                source.sync_to(staging / source.name)
+            except Exception as e:
+                logger.warning("source %s failed: %s", source.name, e)
+
+        current_hash = _dir_hash(staging)
+        if current_hash != last_hash:
+            tmp = digest.with_name(digest.name + ".tmp")
+            old = digest.with_name(digest.name + ".old")
+
+            if tmp.exists():
+                shutil.rmtree(tmp)
+            if old.exists():
+                shutil.rmtree(old)
+
+            shutil.copytree(staging, tmp, symlinks=True)
+
+            if digest.exists():
+                # This rename is the only junction between the sync daemon and Arke.
+                # If Arke consumed digest between exists() and here, this raises — let it.
+                # systemd restarts in 5s, digest is gone, second attempt goes through clean.
+                digest.rename(old)
+
+            tmp.rename(digest)
+
+            if old.exists():
+                shutil.rmtree(old)
+
+            last_hash = current_hash
+            _save_hash(space, last_hash)
+            logger.info("digest published")
+
+        time.sleep(interval)
+
+# ═══════════════════════════════════════════
+# arke/eval/download_corpora.py
+# ═══════════════════════════════════════════
+
+"""Download eval corpora. Run once to populate ~/.arke/data/.
+
+Usage:
+    python -m arke.eval.download_corpora
+
+Corpora:
+    legalbench-rag  — ~87 MB, legal QA benchmark
+    (more to be added)
+"""
+import io
+import sys
+import zipfile
+from pathlib import Path
+from urllib.error import URLError
+from urllib.request import urlopen
+
+DATA_DIR = Path.home() / ".arke" / "data"
+
+CORPORA = {
+    "legalbench-rag": {
+        "url": "https://www.dropbox.com/scl/fo/r7xfa5i3hdsbxex1w6amw/AID389Olvtm-ZLTKAPrw6k4?rlkey=5n8zrbk4c08lbit3iiexofmwg&st=0hu354cq&dl=1",
+        "dest": DATA_DIR / "legalbench-rag",
+        "check": "corpus/*.txt",
+        "size": "~87 MB",
+    },
+}
+
+
+def download(name: str) -> None:
+    corpus = CORPORA[name]
+    dest: Path = corpus["dest"]
+    check_glob: str = corpus["check"]
+
+    if dest.exists() and any(dest.rglob(check_glob.split("/")[-1])):
+        print(f"{name}: already at {dest}")
+        return
+
+    print(f"{name}: downloading {corpus['size']}...")
+    try:
+        raw = urlopen(corpus["url"]).read()
+    except URLError as exc:
+        raise RuntimeError(f"{name}: download failed: {exc}") from exc
+
+    dest.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+        zf.extractall(dest)
+
+    count = sum(1 for _ in dest.rglob("*.txt"))
+    print(f"{name}: extracted {count} files to {dest}")
+
+
+def main() -> None:
+    for name in CORPORA:
+        try:
+            download(name)
+        except RuntimeError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
+
+# ═══════════════════════════════════════════
+# arke/eval/gen.py
+# ═══════════════════════════════════════════
+
+"""Generate eval cases from chunks using LLM.
+
+For each sampled chunk, LLM generates questions that only that chunk can answer.
+This creates ground-truth (query → expected_chunk) pairs for scoring.
+"""
+import json
+import random
+import re
+from dataclasses import dataclass
+
+from arke.server.models import LLM
+from arke.server.types import Chunk
+
+INSTRUCTION = (
+    "You will receive a text chunk from a legal document. "
+    "Generate 1 to 3 questions that ONLY this specific chunk can answer. "
+    "Questions must include specific details — names, numbers, dates, case citations, unique terms. "
+    "Avoid generic questions. "
+    "Return ONLY a JSON array of strings, nothing else. "
+    'Example: ["question 1", "question 2"]'
 )
 
 
-class AskRequest(BaseModel):
+@dataclass(frozen=True)
+class EvalCase:
     query: str
+    expected_key: str  # "doc_id:chunk_index"
 
 
-class IngestRequest(BaseModel):
-    source: str
+def make_cases(llm: LLM, chunks: list[Chunk], limit: int) -> list[EvalCase]:
+    samples = random.sample(chunks, min(limit, len(chunks)))
+    cases: list[EvalCase] = []
+
+    for i, chunk in enumerate(samples):
+        questions = _generate_questions(llm, chunk.clean)
+        key = f"{chunk.doc_id}:{chunk.chunk_index}"
+        cases.extend(EvalCase(query=q, expected_key=key) for q in questions)
+        print(f"  gen {i + 1}/{len(samples)}: {len(questions)} questions")
+
+    print(f"gen done: {len(cases)} cases from {len(samples)} chunks")
+    return cases
 
 
-class SweepRequest(BaseModel):
-    level: str
-    limit: int
+def _generate_questions(llm: LLM, content: str) -> list[str]:
+    raw = llm.chat(None, INSTRUCTION + "\n\nChunk:\n" + content).strip()
 
+    match = re.search(r"\[[\s\S]*]", raw)
+    if not match:
+        return []
 
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
+    try:
+        parsed = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return []
 
+    if not isinstance(parsed, list):
+        return []
 
-@app.post("/ask")
-async def ask(req: AskRequest):
-    result = await engine.ask(req.query)
-    sources = [
-        {
-            "source": h.chunk.source,
-            "content": h.chunk.content[:300],
-            "similarity": round(h.similarity, 3),
-        }
-        for h in result.hits
-    ]
-    return {"answer": result.answer, "sources": sources}
-
-
-@app.post("/ingest")
-async def ingest(req: IngestRequest):
-    await engine.ingest(req.source)
-    return {"status": "ok"}
-
-
-@app.post("/sweep")
-async def sweep(req: SweepRequest):
-    rows = await Arke.sweep(cfg, req.level, req.limit)
-    return {"rows": [{**vars(row.metrics), **vars(row.cfg)} for row in rows]}
-
-
-@app.get("/open/{source:path}")
-async def open_file(source: str):
-    """Opens a document in the OS default application. Local-only."""
-    import subprocess, sys
-    base = Path(cfg.data_path)
-    full = (base / source).resolve()
-    if not full.exists():
-        matches = list(base.rglob(source))
-        if not matches:
-            return {"error": "not found"}
-        full = matches[0].resolve()
-
-    if sys.platform == "linux":
-        subprocess.Popen(["xdg-open", str(full)])
-    elif sys.platform == "darwin":
-        subprocess.Popen(["open", str(full)])
-    else:
-        subprocess.Popen(["start", str(full)], shell=True)
-
-    return {"status": "ok"}
-
-
-if STATIC_DIR.is_dir():
-    @app.get("/{path:path}")
-    async def spa_fallback(path: str):
-        file = STATIC_DIR / path
-        if file.is_file():
-            return FileResponse(file)
-        return FileResponse(STATIC_DIR / "index.html")
+    return [q for q in parsed if isinstance(q, str) and q.strip()]
 
 # ═══════════════════════════════════════════
-# arke/cache.old.py
+# arke/eval/__init__.py
 # ═══════════════════════════════════════════
 
-"""File-based JSONL cache for expensive operations."""
-import hashlib
-import json
+
+# ═══════════════════════════════════════════
+# arke/eval/presets.py
+# ═══════════════════════════════════════════
+
+from dataclasses import replace
+from itertools import product
+
+from arke.server.config import Config
+
+FAST = "fast"
+MEDIUM = "medium"
+THOROUGH = "thorough"
+
+
+def get_preset(level: str, base: Config) -> list[Config]:
+    if level == FAST:
+        return _expand(base, chunk_sizes=[base.chunk_size], overlaps=[base.overlap], alphas=[base.alpha], ks=[base.k])
+    if level == MEDIUM:
+        return _expand(base, chunk_sizes=[base.chunk_size], overlaps=[base.overlap], alphas=[0.0, 0.3, 0.5, 0.7, 1.0], ks=[5, 10, 20])
+    if level == THOROUGH:
+        return _expand(base, chunk_sizes=[500, 1000], overlaps=[0.0, 0.2], alphas=[0.0, 0.3, 0.5, 0.7, 1.0], ks=[5, 10, 20])
+
+    raise ValueError(f"unknown sweep level: {level} (expected: {FAST} | {MEDIUM} | {THOROUGH})")
+
+
+def _expand(base: Config, chunk_sizes: list[int], overlaps: list[float], alphas: list[float], ks: list[int]) -> list[Config]:
+    out: list[Config] = []
+    for chunk_size, overlap, alpha, k in product(chunk_sizes, overlaps, alphas, ks):
+        cfg = replace(base, chunk_size=chunk_size, overlap=overlap, alpha=alpha, k=k)
+        out.append(cfg.resolved())
+    return out
+
+# ═══════════════════════════════════════════
+# arke/eval/sweep.py
+# ═══════════════════════════════════════════
+
+"""Sweep — run eval across preset configs and rank by MRR.
+
+Each config row = full arke-server restart with that config.
+Communicates through mailbox like any real client.
+
+Usage:
+    python -m arke.eval.sweep --space legalbench --level medium --limit 50
+"""
+import os
+import signal
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
 from pathlib import Path
 
-CACHE_DIR = Path(".cache")
+from arke.server import mailbox
+from arke.server.config import Config
+from arke.server.models import Models
+from arke.server.types import Doc
+
+from .gen import EvalCase, make_cases
+from .presets import get_preset
 
 
-def corpus_hash(source_path: str) -> str:
-    """Deterministic hash of source file(s) content."""
-    h = hashlib.md5()
-    p = Path(source_path)
-    if p.is_file():
-        h.update(p.read_bytes())
-    elif p.is_dir():
-        for f in sorted(p.rglob("*.jsonl")):
-            h.update(f.read_bytes())
-    return h.hexdigest()[:12]
+@dataclass(frozen=True)
+class EvalMetrics:
+    precision: float
+    recall: float
+    mrr: float
 
 
-class Cache:
-    """Generic JSONL cache. Doesn't know what it stores — just dicts."""
+@dataclass(frozen=True)
+class SweepRow:
+    cfg: Config
+    metrics: EvalMetrics
 
-    def __init__(self, **params: object) -> None:
-        raw = json.dumps(params, sort_keys=True, default=str)
-        key = hashlib.md5(raw.encode()).hexdigest()[:16]
-        self._path = CACHE_DIR / f"{key}.jsonl"
 
-    @property
-    def path(self) -> Path:
-        return self._path
+def run(space: str, level: str, limit: int) -> list[SweepRow]:
+    base_cfg = Config.from_env().resolved()
+    configs = get_preset(level, base_cfg)
 
-    def exists(self) -> bool:
-        return self._path.exists()
+    # Generate eval cases using base config (one-time)
+    print("generating eval cases...")
+    cases = _generate_cases(space, base_cfg, limit)
+    if not cases:
+        print("error: no eval cases generated", file=sys.stderr)
+        sys.exit(1)
+    print(f"generated {len(cases)} cases\n")
 
-    def load(self) -> list[dict] | None:
-        if not self._path.exists():
-            return None
+    rows: list[SweepRow] = []
+    for idx, cfg in enumerate(configs):
+        print(f"[{idx + 1}/{len(configs)}] chunk={cfg.chunk_size} overlap={cfg.overlap} alpha={cfg.alpha} k={cfg.k}")
+        metrics = _run_row(space, cfg, cases)
+        rows.append(SweepRow(cfg=cfg, metrics=metrics))
+        print(f"  → precision={metrics.precision:.3f} recall={metrics.recall:.3f} MRR={metrics.mrr:.3f}\n")
+
+    rows.sort(key=lambda r: r.metrics.mrr, reverse=True)
+    _print_table(rows)
+    return rows
+
+
+def _generate_cases(space: str, cfg: Config, limit: int) -> list[EvalCase]:
+    """Start server, sample chunks, generate questions, stop server."""
+    proc = _start_server(space, cfg)
+    try:
+        _wait_ready()
+        # ask server to sample chunks for case generation
+        msg_id = mailbox.send({"cmd": "sample", "limit": limit})
+        response = mailbox.receive(msg_id)
+        if not response or not response.get("ok"):
+            raise RuntimeError(f"sample failed: {response}")
+
+        # load models for case generation (cloud preferred for quality)
+        models = Models.load(cfg)
+        from arke.server.types import Chunk
+        chunks = [
+            Chunk(doc_id=c["doc_id"], chunk_index=c["chunk_index"], clean=c["clean"], head=c["head"], tail=c["tail"])
+            for c in response["chunks"]
+        ]
+        return make_cases(models.llm, chunks, limit)
+    finally:
+        _stop_server(proc)
+
+
+def _run_row(space: str, cfg: Config, cases: list[EvalCase]) -> EvalMetrics:
+    proc = _start_server(space, cfg)
+    try:
+        _wait_ready()
+        results = []
+        for case in cases:
+            msg_id = mailbox.send({"cmd": "ask", "query": case.query})
+            response = mailbox.receive(msg_id)
+            hits = response.get("citations", []) if response and response.get("ok") else []
+            results.append((hits, case.expected_key))
+        return _score(results)
+    finally:
+        _stop_server(proc)
+
+
+def _start_server(space: str, cfg: Config) -> subprocess.Popen:
+    env = {
+        **os.environ,
+        "ARKE_SPACE": space,
+        "CHUNK_SIZE": str(cfg.chunk_size),
+        "OVERLAP": str(cfg.overlap),
+        "ALPHA": str(cfg.alpha),
+        "K": str(cfg.k),
+    }
+    proc = subprocess.Popen(["arke-server"], env=env)
+    return proc
+
+
+def _wait_ready(timeout: float = 60.0) -> None:
+    """Poll ping until server responds or timeout."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
         try:
-            return [json.loads(line) for line in self._path.read_text().splitlines()]
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            self._path.unlink(missing_ok=True)
-            print(f"cache corrupt, deleted: {self._path}")
-            return None
+            msg_id = mailbox.send({"cmd": "ping"})
+            response = mailbox.receive.__wrapped__(msg_id, poll_timeout=2.0) if hasattr(mailbox.receive, "__wrapped__") else None
+            # fallback: try direct file check
+            outbox = Path.home() / ".arke" / "outbox" / f"{msg_id}.json"
+            time.sleep(0.5)
+            if outbox.exists():
+                outbox.unlink(missing_ok=True)
+                return
+        except Exception:
+            pass
+        time.sleep(1.0)
+    raise RuntimeError("arke-server did not start in time")
 
-    def save(self, rows: list[dict]) -> None:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self._path, "w") as f:
-            for row in rows:
-                f.write(json.dumps(row) + "\n")
+
+def _stop_server(proc: subprocess.Popen) -> None:
+    proc.send_signal(signal.SIGTERM)
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+
+
+def _score(results: list[tuple[list, str]]) -> EvalMetrics:
+    n = len(results)
+    if n == 0:
+        return EvalMetrics(precision=0.0, recall=0.0, mrr=0.0)
+
+    sum_p = sum_r = sum_rr = 0.0
+    for hits, expected_key in results:
+        hit_keys = [f"{h['source']}:{h.get('chunk_index', '')}" for h in hits]
+        matched = sum(1 for k in hit_keys if k == expected_key)
+
+        sum_p += matched / len(hits) if hits else 0.0
+        sum_r += float(matched > 0)
+
+        for i, k in enumerate(hit_keys):
+            if k == expected_key:
+                sum_rr += 1.0 / (i + 1)
+                break
+
+    return EvalMetrics(precision=sum_p / n, recall=sum_r / n, mrr=sum_rr / n)
+
+
+def _print_table(rows: list[SweepRow]) -> None:
+    header = f"{'chunk':>6} {'overlap':>7} {'alpha':>6} {'k':>4} {'prec':>7} {'recall':>7} {'MRR':>7}"
+    print(f"\n{'Sweep Results (sorted by MRR)':^50}")
+    print(header)
+    print("-" * len(header))
+    best_mrr = rows[0].metrics.mrr if rows else 0.0
+    for r in rows:
+        mrr_str = f"{r.metrics.mrr:.3f}"
+        if r.metrics.mrr == best_mrr:
+            mrr_str += " <-- best"
+        print(
+            f"{r.cfg.chunk_size:>6} {r.cfg.overlap:>7.1f} {r.cfg.alpha:>6.1f} {r.cfg.k:>4}"
+            f" {r.metrics.precision:>7.3f} {r.metrics.recall:>7.3f} {mrr_str}"
+        )
+    print()
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--space", required=True)
+    parser.add_argument("--level", default="medium")
+    parser.add_argument("--limit", type=int, default=50)
+    args = parser.parse_args()
+    run(args.space, args.level, args.limit)
 
 # ═══════════════════════════════════════════
-# arke/chunker.py
+# arke/__init__.py
+# ═══════════════════════════════════════════
+
+
+# ═══════════════════════════════════════════
+# arke/server/backend_cloud.py
+# ═══════════════════════════════════════════
+
+"""Cloud backend — OpenAI API via HTTP."""
+import json
+import urllib.request
+from dataclasses import dataclass
+
+EMBED_BATCH_SIZE = 64
+
+
+@dataclass
+class CloudEmbedder:
+    base_url: str
+    api_key: str
+    model: str
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        result: list[list[float]] = []
+        for offset in range(0, len(texts), EMBED_BATCH_SIZE):
+            batch = texts[offset : offset + EMBED_BATCH_SIZE]
+            res = _post(self.base_url, self.api_key, "/v1/embeddings", {"model": self.model, "input": batch})
+            data = sorted(res["data"], key=lambda d: d["index"])
+            result.extend(d["embedding"] for d in data)
+        return result
+
+
+@dataclass
+class CloudLLM:
+    base_url: str
+    api_key: str
+    model: str
+
+    def chat(self, system: str | None, user: str) -> str:
+        messages: list[dict] = []
+        if system is not None:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": user})
+        res = _post(self.base_url, self.api_key, "/v1/chat/completions", {"model": self.model, "messages": messages})
+        return res["choices"][0]["message"]["content"]
+
+
+def load(base_url: str, api_key: str, embed_model: str, inference_model: str) -> tuple[CloudEmbedder, CloudLLM]:
+    return (
+        CloudEmbedder(base_url, api_key, embed_model),
+        CloudLLM(base_url, api_key, inference_model),
+    )
+
+
+def _post(base_url: str, api_key: str, path: str, body: dict) -> dict:
+    req = urllib.request.Request(
+        base_url + path,
+        data=json.dumps(body).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        return json.loads(resp.read())
+
+# ═══════════════════════════════════════════
+# arke/server/backend_local.py
+# ═══════════════════════════════════════════
+
+"""Local backend — llama-cpp-python, models loaded in-process from .gguf files."""
+from dataclasses import dataclass
+
+EMBED_BATCH_SIZE = 64
+
+
+@dataclass
+class LocalEmbedder:
+    _model: object
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        result: list[list[float]] = []
+        for offset in range(0, len(texts), EMBED_BATCH_SIZE):
+            batch = texts[offset : offset + EMBED_BATCH_SIZE]
+            result.extend(self._model.embed(batch))
+        return result
+
+
+@dataclass
+class LocalLLM:
+    _model: object
+
+    def chat(self, system: str | None, user: str) -> str:
+        messages: list[dict] = []
+        if system is not None:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": user})
+        response = self._model.create_chat_completion(messages=messages)
+        return response["choices"][0]["message"]["content"]
+
+
+def load(embed_model_path: str, inference_model_path: str) -> tuple[LocalEmbedder, LocalLLM]:
+    from llama_cpp import Llama
+    embedder = Llama(model_path=embed_model_path, embedding=True, n_ctx=512, verbose=False)
+    llm = Llama(model_path=inference_model_path, n_ctx=4096, verbose=False)
+    return LocalEmbedder(embedder), LocalLLM(llm)
+
+# ═══════════════════════════════════════════
+# arke/server/bm25.py
+# ═══════════════════════════════════════════
+
+"""In-memory BM25 index. Built once at ingest, queried on every ask.
+
+Standard Okapi BM25 with k1=1.5, b=0.75.
+Keys are arbitrary strings — we use "<doc_id>:<chunk_index>".
+"""
+import math
+import re
+from dataclasses import dataclass, field
+
+K1 = 1.5
+B = 0.75
+
+
+def _tokenize(text: str) -> list[str]:
+    return re.findall(r"[a-z0-9]+", text.lower())
+
+
+@dataclass
+class BM25Index:
+    _docs: dict[str, list[str]] = field(default_factory=dict)       # key → tokens
+    _df: dict[str, int] = field(default_factory=dict)               # term → doc count
+    _avgdl: float = 0.0
+
+    def add(self, key: str, text: str) -> None:
+        tokens = _tokenize(text)
+        self._docs[key] = tokens
+        for term in set(tokens):
+            self._df[term] = self._df.get(term, 0) + 1
+
+    def build(self) -> None:
+        """Call after all add() calls to finalize avgdl."""
+        if self._docs:
+            self._avgdl = sum(len(t) for t in self._docs.values()) / len(self._docs)
+
+    def scores(self, query: str) -> dict[str, float]:
+        """Return BM25 score for every indexed key. Zero scores omitted."""
+        terms = _tokenize(query)
+        if not terms or not self._docs:
+            return {}
+
+        n = len(self._docs)
+        result: dict[str, float] = {}
+
+        for term in terms:
+            df = self._df.get(term, 0)
+            if df == 0:
+                continue
+            idf = math.log((n - df + 0.5) / (df + 0.5) + 1)
+
+            for key, tokens in self._docs.items():
+                tf = tokens.count(term)
+                if tf == 0:
+                    continue
+                dl = len(tokens)
+                norm = tf * (K1 + 1) / (tf + K1 * (1 - B + B * dl / self._avgdl))
+                result[key] = result.get(key, 0.0) + idf * norm
+
+        return result
+
+    def clear(self) -> None:
+        self._docs.clear()
+        self._df.clear()
+        self._avgdl = 0.0
+
+# ═══════════════════════════════════════════
+# arke/server/chunker.py
 # ═══════════════════════════════════════════
 
 from dataclasses import dataclass
@@ -319,86 +1269,7 @@ def _merge(splits: list[str], chunk_size: int) -> list[str]:
     return raw
 
 # ═══════════════════════════════════════════
-# arke/cli.py
-# ═══════════════════════════════════════════
-
-import asyncio
-
-import click
-from dotenv import load_dotenv
-
-from . import Arke
-from .config import Config
-
-
-def _arke() -> Arke:
-    return Arke(Config.from_env())
-
-
-@click.group(help="Arke — RAG with built-in eval")
-def app() -> None:
-    pass
-
-
-@app.command(help="Digest raw source into cached JSONL.")
-@click.argument("source", default="")
-def digest(source: str) -> None:
-    cfg = Config.from_env()
-    data_path = source or cfg.data_path
-    Arke.digest(data_path)
-
-
-@app.command(help="Ingest documents from a JSONL file or directory.")
-@click.argument("source")
-def ingest(source: str) -> None:
-    async def run() -> None:
-        async with _arke() as m:
-            await m.ingest(source)
-    asyncio.run(run())
-
-
-@app.command(help="Ask a question against the ingested corpus.")
-@click.argument("query")
-def ask(query: str) -> None:
-    async def run() -> None:
-        async with _arke() as m:
-            result = await m.ask(query)
-            print(f"\n{result.answer}\n")
-    asyncio.run(run())
-
-
-@app.command(help="Run an eval sweep across preset configurations.")
-@click.argument("level")
-@click.option("--limit", "-l", default=30, type=int, help="Number of sample chunks for eval")
-def sweep(level: str, limit: int) -> None:
-    async def run() -> None:
-        cfg = Config.from_env()
-        await Arke.sweep(cfg, level, limit)
-    asyncio.run(run())
-
-
-@app.command(help="Start the REST API server.")
-@click.option("--port", "-p", default=8000, type=int, help="Port to listen on")
-def serve(port: int) -> None:
-    import uvicorn
-    from .api import app as api_app
-    uvicorn.run(api_app, host="0.0.0.0", port=port)
-
-
-def main() -> None:
-    load_dotenv()
-    try:
-        app()
-    except (RuntimeError, ValueError) as exc:
-        print(f"error: {exc}")
-        raise SystemExit(1)
-
-
-if __name__ == "__main__":
-    main()
-
-# ═══════════════════════════════════════════
-# arke/config.py
+# arke/server/config.py
 # ═══════════════════════════════════════════
 
 from __future__ import annotations
@@ -409,34 +1280,42 @@ from dataclasses import dataclass, replace
 
 @dataclass(frozen=True)
 class Config:
-    database_url: str = ""
-    data_path: str = ""
-    api_key: str = ""
-    embedder_url: str = ""
-    embedder_model: str = ""
+    # Dataspace
+    space: str = "default"
+
+    # Backend: "local" (llama-cpp-python) or "cloud" (OpenAI)
+    backend: str = "local"
+
+    # Local backend — paths to .gguf files
+    embed_model_path: str = ""
+    inference_model_path: str = ""
+
+    # Cloud backend
+    cloud_api_key: str = ""
+    cloud_base_url: str = "https://api.openai.com"
+    cloud_embed_model: str = "text-embedding-3-small"
+    cloud_inference_model: str = "gpt-4o"
+
+    # RAG parameters
     embedding_dim: int = 0
-    inference_url: str = ""
-    inference_model: str = ""
     chunk_size: int = 600
     overlap: float = 0.0
     alpha: float = 0.7
     k: int = 5
 
     def resolved(self) -> Config:
-        """Fills empty fields from defaults, validates, returns new Config."""
-        if not self.database_url:
-            raise ValueError("config: database_url is required")
-        if not self.data_path:
-            raise ValueError("config: data_path is required — set DATA_PATH in .env")
+        if self.backend == "local":
+            if not self.embed_model_path:
+                raise ValueError("config: EMBED_MODEL_PATH is required for local backend")
+            if not self.inference_model_path:
+                raise ValueError("config: INFERENCE_MODEL_PATH is required for local backend")
+        elif self.backend == "cloud":
+            if not self.cloud_api_key:
+                raise ValueError("config: CLOUD_API_KEY is required for cloud backend")
+        else:
+            raise ValueError(f"config: BACKEND must be 'local' or 'cloud', got '{self.backend}'")
 
-        cfg = replace(
-            self,
-            embedder_url=self.embedder_url or DEFAULTS.embedder_url,
-            embedder_model=self.embedder_model or DEFAULTS.embedder_model,
-            embedding_dim=self.embedding_dim or DEFAULTS.embedding_dim,
-            inference_url=self.inference_url or DEFAULTS.inference_url,
-            inference_model=self.inference_model or DEFAULTS.inference_model,
-        )
+        cfg = replace(self, embedding_dim=self.embedding_dim or DEFAULTS.embedding_dim)
 
         if cfg.chunk_size < 100 or cfg.chunk_size > 10000:
             raise ValueError(f"config: chunk_size must be 100..10000, got {cfg.chunk_size}")
@@ -452,534 +1331,498 @@ class Config:
     @staticmethod
     def from_env() -> Config:
         return Config(
-            database_url=os.environ.get("DATABASE_URL", ""),
-            data_path=os.environ.get("DATA_PATH", ""),
-            api_key=os.environ.get("API_KEY", ""),
-            embedder_url=os.environ.get("EMBEDDER_URL", ""),
-            embedder_model=os.environ.get("EMBEDDER_MODEL", ""),
+            space=os.environ.get("ARKE_SPACE", "default"),
+            backend=os.environ.get("BACKEND", "local"),
+            embed_model_path=os.environ.get("EMBED_MODEL_PATH", ""),
+            inference_model_path=os.environ.get("INFERENCE_MODEL_PATH", ""),
+            cloud_api_key=os.environ.get("CLOUD_API_KEY", ""),
+            cloud_base_url=os.environ.get("CLOUD_BASE_URL", "https://api.openai.com"),
+            cloud_embed_model=os.environ.get("CLOUD_EMBED_MODEL", "text-embedding-3-small"),
+            cloud_inference_model=os.environ.get("CLOUD_INFERENCE_MODEL", "gpt-4o"),
             embedding_dim=int(os.environ.get("EMBEDDING_DIM", "0")),
-            inference_url=os.environ.get("INFERENCE_URL", ""),
-            inference_model=os.environ.get("INFERENCE_MODEL", ""),
+            chunk_size=int(os.environ.get("CHUNK_SIZE", "600")),
+            overlap=float(os.environ.get("OVERLAP", "0.0")),
+            alpha=float(os.environ.get("ALPHA", "0.7")),
+            k=int(os.environ.get("K", "5")),
         )
 
 
 DEFAULTS = Config(
-    embedder_url="http://localhost:11434",
-    embedder_model="bge-m3",
     embedding_dim=1024,
-    inference_url="http://localhost:11434",
-    inference_model="llama3:8b-instruct-q4_K_M",
 )
 
 # ═══════════════════════════════════════════
-# arke/corpus.py
+# arke/server/__init__.py
 # ═══════════════════════════════════════════
 
-"""LegalBench-RAG downloader. Used by digest when DATA_PATH is the Dropbox URL."""
-import io
-import zipfile
-from pathlib import Path
-from urllib.error import URLError
-from urllib.request import urlopen
-
-LEGALBENCH_URL = "https://www.dropbox.com/scl/fo/r7xfa5i3hdsbxex1w6amw/AID389Olvtm-ZLTKAPrw6k4?rlkey=5n8zrbk4c08lbit3iiexofmwg&st=0hu354cq&dl=1"
-DATA_DIR = Path.home() / ".arke" / "data" / "legalbench-rag"
-
-
-def download_legalbench() -> str:
-    """Download and extract LegalBench-RAG corpus. Returns path to corpus dir.
-    Idempotent — skips download if already present."""
-    corpus_dir = DATA_DIR / "corpus"
-    if corpus_dir.exists() and any(corpus_dir.rglob("*.txt")):
-        print(f"legalbench-rag already at {corpus_dir}")
-        return str(corpus_dir)
-
-    print("downloading legalbench-rag (~87 MB)...")
-    try:
-        raw = urlopen(LEGALBENCH_URL).read()
-    except URLError as exc:
-        raise RuntimeError(f"failed to download legalbench-rag: {exc}") from exc
-
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
-        zf.extractall(DATA_DIR)
-
-    if not corpus_dir.exists():
-        raise RuntimeError(f"expected {corpus_dir} after extraction, not found")
-
-    count = sum(1 for _ in corpus_dir.rglob("*.txt"))
-    print(f"extracted {count} documents to {corpus_dir}")
-    return str(corpus_dir)
 
 # ═══════════════════════════════════════════
-# arke/db.old.py
+# arke/server/loader.py
 # ═══════════════════════════════════════════
 
-import asyncpg
-import pgvector.asyncpg
+"""Loader — turns raw files from digest/ into (Doc, text) pairs.
 
-from .config import Config
-from .types import Chunk, SearchHit
-
-
-BATCH_SIZE = 50
-
-
-class Db:
-    def __init__(self, dsn: str, embedding_dim: int) -> None:
-        self._dsn = dsn
-        self._embedding_dim = embedding_dim
-
-    async def open(self) -> None:
-        try:
-            self._pool = await asyncpg.create_pool(dsn=self._dsn, init=_init_conn)
-        except (OSError, asyncpg.PostgresError) as exc:
-            raise RuntimeError(f"database connection failed ({self._dsn}): {exc}") from exc
-
-    async def close(self) -> None:
-        await self._pool.close()
-
-    async def init_schema(self) -> None:
-        try:
-            await self._init_schema()
-        except asyncpg.UndefinedObjectError as exc:
-            raise RuntimeError("pgvector extension is not installed on this PostgreSQL server") from exc
-
-    async def _init_schema(self) -> None:
-        async with self._pool.acquire() as conn:
-            await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
-            await conn.execute(f"""
-                CREATE TABLE IF NOT EXISTS chunks (
-                    id          TEXT PRIMARY KEY,
-                    source      TEXT NOT NULL CHECK (length(source) > 0),
-                    chunk_index INTEGER NOT NULL CHECK (chunk_index >= 0),
-                    content     TEXT NOT NULL CHECK (length(content) > 0),
-                    embedding   vector({self._embedding_dim}) NOT NULL,
-                    metadata    JSONB NOT NULL DEFAULT '{{}}' CHECK (jsonb_typeof(metadata) = 'object'),
-                    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    tsv         tsvector GENERATED ALWAYS AS (to_tsvector('simple', content)) STORED NOT NULL
-                )
-            """)
-            await conn.execute("CREATE INDEX IF NOT EXISTS chunks_tsv_idx ON chunks USING GIN (tsv)")
-            await conn.execute(f"CREATE INDEX IF NOT EXISTS chunks_embedding_idx ON chunks USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64)")
-
-    async def insert(self, chunks: list[Chunk]) -> None:
-        rows = [c.to_row() for c in chunks]
-        async with self._pool.acquire() as conn:
-            async with conn.transaction():
-                for offset in range(0, len(rows), BATCH_SIZE):
-                    await conn.executemany(
-                        """
-                        INSERT INTO chunks (id, source, chunk_index, content, embedding, metadata, created_at)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7)
-                        ON CONFLICT (id) DO NOTHING
-                        """,
-                        rows[offset : offset + BATCH_SIZE],
-                    )
-
-    async def search(self, cfg: Config, query_vec: list[float], query_text: str) -> list[SearchHit]:
-        """Hybrid search: alpha*cosine + (1-alpha)*bm25_normalized."""
-        async with self._pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                WITH scored AS (
-                    SELECT id, content, source, chunk_index, metadata, created_at, embedding,
-                           1 - (embedding <=> $1) AS cosine_raw,
-                           ts_rank(tsv, plainto_tsquery('simple', $3)) AS bm25_raw
-                    FROM chunks
-                ),
-                bounds AS (SELECT max(bm25_raw) AS max_bm25 FROM scored)
-                SELECT s.id, s.content, s.source, s.chunk_index, s.metadata, s.created_at, s.embedding,
-                       ($4 * s.cosine_raw +
-                        (1.0 - $4) * CASE WHEN b.max_bm25 > 0 THEN s.bm25_raw / b.max_bm25 ELSE 0 END
-                       ) AS similarity
-                FROM scored s, bounds b
-                ORDER BY similarity DESC
-                LIMIT $2
-                """,
-                query_vec, cfg.k, query_text, cfg.alpha,
-            )
-        return [
-            SearchHit(chunk=Chunk.from_dict(dict(r)), similarity=float(r["similarity"]))
-            for r in rows
-        ]
-
-    async def fetch_all(self) -> list[Chunk]:
-        async with self._pool.acquire() as conn:
-            rows = await conn.fetch("SELECT id, source, chunk_index, content, embedding, metadata, created_at FROM chunks")
-        return [Chunk.from_dict(dict(r)) for r in rows]
-
-    async def truncate(self) -> None:
-        async with self._pool.acquire() as conn:
-            await conn.execute("TRUNCATE chunks")
-
-    async def sample(self, limit: int) -> list[Chunk]:
-        async with self._pool.acquire() as conn:
-            rows = await conn.fetch("SELECT id, source, chunk_index, content, embedding, metadata, created_at FROM chunks ORDER BY random() LIMIT $1", limit)
-        return [Chunk.from_dict(dict(r)) for r in rows]
-
-
-async def _init_conn(conn: asyncpg.Connection) -> None:
-    await pgvector.asyncpg.register_vector(conn)
-
-# ═══════════════════════════════════════════
-# arke/digest.py
-# ═══════════════════════════════════════════
-
-"""Digest: parse raw source into cached JSONL.
-
-Converts any supported source (local JSONL, URL) into a normalized
-cache file that sweep and ingest can consume. This is the single
-entry point for all data — no silent downloads, no fallbacks.
+Dispatcher uses file extension. Supported: .txt .md .pdf .docx .msg
+Unsupported files are skipped silently — unknown formats are normal in digest/.
 """
-from .cache import Cache, corpus_hash
-from .corpus import download_legalbench
-from .loader import load_docs
+import hashlib
+import logging
+from pathlib import Path
+
 from .types import Doc
 
-
-def digest(data_path: str) -> str:
-    """Parse source into cached JSONL. Returns path to cache file.
-    Idempotent — if cache exists for this source, returns immediately."""
-    if not data_path:
-        raise ValueError("data_path is required — set DATA_PATH in .env")
-
-    if data_path.startswith("http"):
-        return _digest_url(data_path)
-    return _digest_local(data_path)
+logger = logging.getLogger(__name__)
 
 
-def _digest_url(url: str) -> str:
-    corpus_path = download_legalbench()
-    return _digest_local(corpus_path)
+def load_digest(digest_path: Path) -> list[tuple[Doc, str]]:
+    """Parse all supported files under digest_path. Returns (Doc, text) pairs."""
+    results: list[tuple[Doc, str]] = []
+    for path in sorted(digest_path.rglob("*")):
+        if not path.is_file() or path.name.startswith("."):
+            continue
+        result = load_file(path, root=digest_path)
+        if result is not None:
+            results.append(result)
+    return results
 
 
-def _digest_local(path: str) -> str:
-    chash = corpus_hash(path)
-    cache = Cache(local=chash)
-    if cache.exists():
-        return str(cache.path)
+def load_file(path: Path, root: Path | None = None) -> tuple[Doc, str] | None:
+    """Parse a single file. Returns (Doc, text) or None if unsupported/empty."""
+    suffix = path.suffix.lower()
 
-    docs = load_docs(path)
-    rows = [_doc_to_dict(d) for d in docs]
-    cache.save(rows)
-    print(f"digested {len(rows)} docs from {path}")
-    return str(cache.path)
+    match suffix:
+        case ".txt" | ".md":
+            text = _load_txt(path)
+        case ".pdf":
+            text = _load_pdf(path)
+        case ".docx":
+            text = _load_docx(path)
+        case ".msg":
+            text = _load_msg(path)
+        case _:
+            logger.debug("skipping unsupported file: %s", path.name)
+            return None
+
+    if not text or not text.strip():
+        return None
+
+    source = str(path.relative_to(root)) if root else path.name
+    stat = path.stat()
+    doc = Doc(
+        id=_content_id(path),
+        source=source,
+        created=int(stat.st_ctime),
+        modified=int(stat.st_mtime),
+        metadata={"filename": path.name, "suffix": suffix},
+    )
+    return doc, text.strip()
 
 
-def _doc_to_dict(doc: Doc) -> dict:
-    return {
-        "content": doc.content,
-        "source": doc.source,
-        "metadata": doc.metadata,
-        "created_at": doc.created_at.isoformat(),
+def _content_id(path: Path) -> str:
+    return hashlib.md5(path.read_bytes()).hexdigest()
+
+
+def _load_txt(path: Path) -> str:
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
+def _load_pdf(path: Path) -> str:
+    import pdfplumber
+    pages: list[str] = []
+    with pdfplumber.open(path) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text()
+            if text:
+                pages.append(text)
+    return "\n\n".join(pages)
+
+
+def _load_docx(path: Path) -> str:
+    from docx import Document
+    doc = Document(path)
+    return "\n\n".join(p.text for p in doc.paragraphs if p.text.strip())
+
+
+def _load_msg(path: Path) -> str:
+    import extract_msg
+    with extract_msg.Message(str(path)) as msg:
+        parts: list[str] = []
+        if msg.subject:
+            parts.append(f"Subject: {msg.subject}")
+        if msg.body:
+            parts.append(msg.body)
+        return "\n\n".join(parts)
+
+# ═══════════════════════════════════════════
+# arke/server/mailbox.py
+# ═══════════════════════════════════════════
+
+"""Inbox/outbox file queue. Arke's only coordination primitive.
+
+Layout:
+    ~/.arke/inbox/<uuid>.json   — incoming request
+    ~/.arke/outbox/<uuid>.json  — response written by Arke
+
+Writers drop a file in inbox and poll outbox for the response.
+Arke scans inbox on every tick, processes, writes outbox.
+"""
+import json
+import os
+import time
+import uuid
+from pathlib import Path
+
+ARKE_HOME = Path("~/.arke").expanduser()
+INBOX = ARKE_HOME / "inbox"
+OUTBOX = ARKE_HOME / "outbox"
+
+POLL_INTERVAL = 0.1   # seconds between outbox polls
+POLL_TIMEOUT  = 120.0 # max seconds to wait for a response
+
+
+def setup() -> None:
+    INBOX.mkdir(parents=True, exist_ok=True)
+    OUTBOX.mkdir(parents=True, exist_ok=True)
+
+
+def send(request: dict) -> str:
+    """Write a request to inbox. Returns the message id."""
+    msg_id = str(uuid.uuid4())
+    _atomic_write(INBOX / f"{msg_id}.json", request)
+    return msg_id
+
+
+def receive(msg_id: str) -> dict | None:
+    """Poll outbox for a response. Blocks until response arrives or timeout."""
+    path = OUTBOX / f"{msg_id}.json"
+    deadline = time.monotonic() + POLL_TIMEOUT
+
+    while time.monotonic() < deadline:
+        if path.exists():
+            data = json.loads(path.read_text())
+            path.unlink(missing_ok=True)
+            return data
+        time.sleep(POLL_INTERVAL)
+
+    return None
+
+
+def drain() -> list[tuple[str, dict]]:
+    """Return all pending inbox messages as (msg_id, request) pairs. Removes files."""
+    messages: list[tuple[str, dict]] = []
+    for f in sorted(INBOX.glob("*.json")):
+        try:
+            data = json.loads(f.read_text())
+            messages.append((f.stem, data))
+            f.unlink(missing_ok=True)
+        except Exception:
+            f.unlink(missing_ok=True)
+    return messages
+
+
+def reply(msg_id: str, response: dict) -> None:
+    """Write a response to outbox."""
+    _atomic_write(OUTBOX / f"{msg_id}.json", response)
+
+
+def _atomic_write(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data))
+    tmp.replace(path)
+
+# ═══════════════════════════════════════════
+# arke/server/main.py
+# ═══════════════════════════════════════════
+
+"""Arke — the living organism.
+
+Startup sequence:
+  1. mount space (sdb)
+  2. load config + models
+  3. consume digest/ if present
+  4. enter main loop
+
+Main loop (1-second pulse):
+  - drain inbox  → process requests → write outbox
+  - check digest → re-ingest if hash changed
+"""
+import hashlib
+import logging
+import time
+from pathlib import Path
+
+import numpy as np
+
+from . import chunker, loader, mailbox, sdb
+from .bm25 import BM25Index
+from .config import Config
+from .models import Models
+from .space import mount as mount_space
+from .types import Chunk, Doc, SearchHit
+
+logger = logging.getLogger(__name__)
+
+TICK = 1.0  # seconds
+
+SYSTEM_PROMPT = (
+    "You are a legal research assistant. "
+    "Answer based only on the provided documents. "
+    "Be concise and cite the source for every claim."
+)
+
+
+def run() -> None:
+    mailbox.setup()
+    cfg = Config.from_env().resolved()
+    space = mount_space(cfg.space)
+    models = Models.load(cfg)
+
+    digest_path = space.path / "digest"
+    docs: dict[str, Doc] = {}
+    bm25 = BM25Index()
+    last_digest_hash = ""
+
+    if digest_path.exists():
+        logger.info("loading digest on startup...")
+        last_digest_hash = _ingest(digest_path, cfg, models, docs, bm25)
+
+    logger.info("arke ready — %d docs, %d chunks", len(docs), _chunk_count(docs))
+
+    while True:
+        _drain(docs, bm25, cfg, models)
+        last_digest_hash = _watch_digest(digest_path, last_digest_hash, cfg, models, docs, bm25)
+        time.sleep(TICK)
+
+
+# --- ingest ------------------------------------------------------------------
+
+def _ingest(digest_path: Path, cfg: Config, models: Models, docs: dict[str, Doc], bm25: BM25Index) -> str:
+    docs.clear()
+    bm25.clear()
+    model_key = cfg.embed_model_path or cfg.cloud_embed_model
+
+    for path in sorted(digest_path.rglob("*")):
+        if not path.is_file() or path.name.startswith("."):
+            continue
+
+        result = loader.load_file(path, root=digest_path)
+        if result is None:
+            continue
+
+        doc, text = result
+
+        sdb.put_bin("sources", doc.id, path.read_bytes())
+
+        chunk_datas = chunker.chunk(text, cfg.chunk_size, cfg.overlap)
+        for i, cd in enumerate(chunk_datas):
+            chunk = Chunk(doc_id=doc.id, chunk_index=i, clean=cd.clean, head=cd.head, tail=cd.tail)
+
+            if not chunk.load_embedding(model_key, "1"):
+                vec = models.embedder.embed([chunk.overlapped()])[0]
+                chunk.embedding = np.array(vec, dtype=np.float32)
+                chunk.save_embedding(model_key, "1")
+
+            bm25.add(f"{doc.id}:{i}", chunk.overlapped())
+            doc.chunks.append(chunk)
+
+        doc.save()
+        docs[doc.id] = doc
+
+    bm25.build()
+    logger.info("ingest done — %d docs, %d chunks", len(docs), _chunk_count(docs))
+    return _dir_hash(digest_path)
+
+
+# --- main loop ---------------------------------------------------------------
+
+def _drain(docs: dict[str, Doc], bm25: BM25Index, cfg: Config, models: Models) -> None:
+    for msg_id, request in mailbox.drain():
+        try:
+            response = _dispatch(request, docs, bm25, cfg, models)
+        except Exception as e:
+            logger.warning("handler error: %s", e)
+            response = {"ok": False, "error": str(e)}
+        mailbox.reply(msg_id, response)
+
+
+def _dispatch(request: dict, docs: dict[str, Doc], bm25: BM25Index, cfg: Config, models: Models) -> dict:
+    cmd = request.get("cmd")
+
+    if cmd == "ask":
+        return _ask(request, docs, bm25, cfg, models)
+
+    if cmd == "ping":
+        return {"ok": True, "pong": True}
+
+    if cmd == "sample":
+        return _sample(request, docs)
+
+    return {"ok": False, "error": f"unknown cmd: {cmd}"}
+
+
+def _watch_digest(
+    digest_path: Path,
+    last_hash: str,
+    cfg: Config,
+    models: Models,
+    docs: dict[str, Doc],
+    bm25: BM25Index,
+) -> str:
+    if not digest_path.exists():
+        return last_hash
+
+    current_hash = _dir_hash(digest_path)
+    if current_hash == last_hash:
+        return last_hash
+
+    logger.info("new digest detected, re-ingesting...")
+    return _ingest(digest_path, cfg, models, docs, bm25)
+
+
+# --- ask ---------------------------------------------------------------------
+
+def _ask(request: dict, docs: dict[str, Doc], bm25: BM25Index, cfg: Config, models: Models) -> dict:
+    query = request.get("query", "")
+    if not query:
+        return {"ok": False, "error": "query is required"}
+
+    q_vec = np.array(models.embedder.embed([query])[0], dtype=np.float32)
+    hits = _hybrid_search(docs, bm25, q_vec, query, cfg.k, cfg.alpha)
+
+    if not hits:
+        return {"ok": True, "answer": "No relevant documents found.", "citations": []}
+
+    context = "\n\n".join(
+        f"[{i+1}] (source: {h.chunk.doc_id[:8]}) {h.chunk.clean}"
+        for i, h in enumerate(hits)
+    )
+    answer = models.llm.chat(SYSTEM_PROMPT, f"Documents:\n{context}\n\nQuestion: {query}")
+
+    citations = [
+        {"source": h.chunk.doc_id, "text": h.chunk.clean[:200], "score": round(h.similarity, 3)}
+        for h in hits
+    ]
+    return {"ok": True, "answer": answer, "citations": citations}
+
+
+def _sample(request: dict, docs: dict[str, Doc]) -> dict:
+    import random
+    limit = request.get("limit", 50)
+    all_chunks = [chunk for doc in docs.values() for chunk in doc.chunks]
+    sample = random.sample(all_chunks, min(limit, len(all_chunks)))
+    return {"ok": True, "chunks": [
+        {"doc_id": c.doc_id, "chunk_index": c.chunk_index, "clean": c.clean, "head": c.head, "tail": c.tail}
+        for c in sample
+    ]}
+
+
+def _hybrid_search(
+    docs: dict[str, Doc],
+    bm25: BM25Index,
+    q_vec: np.ndarray,
+    query: str,
+    k: int,
+    alpha: float,
+) -> list[SearchHit]:
+    q_norm = np.linalg.norm(q_vec)
+    if q_norm == 0:
+        return []
+
+    # cosine scores
+    cosine: dict[str, float] = {}
+    for doc in docs.values():
+        for chunk in doc.chunks:
+            if chunk.embedding is None:
+                continue
+            c_norm = np.linalg.norm(chunk.embedding)
+            if c_norm == 0:
+                continue
+            key = f"{chunk.doc_id}:{chunk.chunk_index}"
+            cosine[key] = float(np.dot(q_vec, chunk.embedding) / (q_norm * c_norm))
+
+    # bm25 scores — normalize to [0, 1]
+    bm25_raw = bm25.scores(query)
+    bm25_max = max(bm25_raw.values(), default=1.0)
+    bm25_norm = {k: v / bm25_max for k, v in bm25_raw.items()} if bm25_max > 0 else {}
+
+    # hybrid score
+    all_keys = set(cosine) | set(bm25_norm)
+    scored: list[tuple[str, float]] = []
+    for key in all_keys:
+        score = alpha * cosine.get(key, 0.0) + (1 - alpha) * bm25_norm.get(key, 0.0)
+        scored.append((key, score))
+
+    scored.sort(key=lambda x: x[1], reverse=True)
+
+    # resolve keys back to chunks
+    chunk_map: dict[str, Chunk] = {
+        f"{chunk.doc_id}:{chunk.chunk_index}": chunk
+        for doc in docs.values()
+        for chunk in doc.chunks
     }
 
+    hits: list[SearchHit] = []
+    for key, score in scored[:k]:
+        chunk = chunk_map.get(key)
+        if chunk:
+            hits.append(SearchHit(chunk=chunk, similarity=score))
+    return hits
+
+
+# --- helpers -----------------------------------------------------------------
+
+def _chunk_count(docs: dict[str, Doc]) -> int:
+    return sum(len(d.chunks) for d in docs.values())
+
+
+def _dir_hash(path: Path) -> str:
+    h = hashlib.md5()
+    for f in sorted(path.rglob("*")):
+        if f.is_file():
+            st = f.stat()
+            h.update(str(f.relative_to(path)).encode())
+            h.update(str(st.st_size).encode())
+            h.update(str(st.st_mtime_ns).encode())
+    return h.hexdigest()
+
 # ═══════════════════════════════════════════
-# arke/gen.py
+# arke/server/models.py
 # ═══════════════════════════════════════════
 
+"""Models — Embedder and LLM protocols + factory."""
 from dataclasses import dataclass
-
-import asyncio
-import json
-import re
-
-from . import Arke
-from .models import chat
-
-CONCURRENCY = 10
-
-
-@dataclass(frozen=True)
-class EvalCase:
-    query: str
-    expected_ids: list[str]
-
-
-async def make_cases(engine: Arke, limit: int) -> list[EvalCase]:
-    """Samples random chunks and generates eval questions concurrently."""
-    samples = await engine.db.sample(limit)
-    semaphore = asyncio.Semaphore(CONCURRENCY)
-    done = 0
-
-    async def process(chunk) -> list[EvalCase]:
-        nonlocal done
-        async with semaphore:
-            questions = await _generate_questions(engine, chunk.content)
-            done += 1
-            print(f"  gen {done}/{len(samples)}")
-            return [EvalCase(query=q, expected_ids=[chunk.id]) for q in questions]
-
-    tasks = [process(chunk) for chunk in samples]
-    results = await asyncio.gather(*tasks)
-
-    cases = [case for batch in results for case in batch]
-    print(f"gen done: {len(cases)} cases from {len(samples)} chunks")
-    return cases
-
-
-async def _generate_questions(engine: Arke, content: str) -> list[str]:
-    instruction = "You will receive a text chunk from a personal knowledge base. Generate 1 to 3 questions that ONLY this specific chunk can answer. Questions must include specific details from the text — names, numbers, dates, unique terms. Avoid generic questions. Return ONLY a JSON array of strings, nothing else. Example: [\"question 1\", \"question 2\"]"
-    prompt = instruction + "\n\nChunk:\n" + content
-    raw = await chat(engine.cfg, engine.http, None, prompt)
-    raw = raw.strip()
-
-    match = re.search(r"\[[\s\S]*]", raw)
-    if not match:
-        return []
-
-    try:
-        parsed = json.loads(match.group(0))
-    except json.JSONDecodeError:
-        return []
-
-    if not isinstance(parsed, list):
-        return []
-
-    return [q for q in parsed if isinstance(q, str) and q]
-
-# ═══════════════════════════════════════════
-# arke/__init__.py
-# ═══════════════════════════════════════════
-
-from __future__ import annotations
-
-from .types import Chunk, Doc, SearchAnswer, SearchHit
-
-__all__ = ["Chunk", "Doc", "SearchAnswer", "SearchHit"]
-
-# ═══════════════════════════════════════════
-# arke/loader.py
-# ═══════════════════════════════════════════
-
-import json
-from datetime import datetime, timezone
-from pathlib import Path
-
-from .types import Doc
-
-
-def load_docs(source_path: str) -> list[Doc]:
-    path = Path(source_path)
-    if not path.is_dir():
-        return _load_file(path)
-
-    jsonl_files = sorted(path.glob("*.jsonl"))
-    txt_files = sorted(path.rglob("*.txt"))
-
-    docs: list[Doc] = []
-    for file in jsonl_files:
-        docs.extend(_load_file(file))
-    for file in txt_files:
-        docs.extend(_load_txt(file, path))
-    return docs
-
-
-def _load_file(file: Path) -> list[Doc]:
-    """Reads a JSONL file and returns valid docs. System boundary: invalid
-    lines and invalid records are dropped silently. The file stem serves
-    as a source fallback when a record omits its own."""
-    fallback = file.stem
-    docs: list[Doc] = []
-    for line in file.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-
-        try:
-            raw = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-
-        if not isinstance(raw, dict):
-            continue
-
-        content = raw.get("content")
-        if not isinstance(content, str) or not content.strip():
-            continue
-
-        source_raw = raw.get("source")
-        source = source_raw if isinstance(source_raw, str) and source_raw else fallback
-
-        raw_date = raw.get("created_at")
-        created_at = datetime.now(timezone.utc)
-        if isinstance(raw_date, str):
-            try:
-                created_at = datetime.fromisoformat(raw_date.replace("Z", "+00:00"))
-            except ValueError:
-                pass
-
-        metadata_raw = raw.get("metadata")
-        metadata = metadata_raw if isinstance(metadata_raw, dict) else {}
-
-        docs.append(Doc(content=content, source=source, created_at=created_at, metadata=metadata))
-
-    return docs
-
-
-def _load_txt(file: Path, root: Path) -> list[Doc]:
-    """Reads a plain text file as a single Doc. Source = relative path from root."""
-    content = file.read_text(encoding="utf-8").strip()
-    if not content:
-        return []
-
-    source = str(file.relative_to(root))
-    return [Doc(
-        content=content,
-        source=source,
-        created_at=datetime.now(timezone.utc),
-        metadata={},
-    )]
-
-# ═══════════════════════════════════════════
-# arke/models.py
-# ═══════════════════════════════════════════
-
-"""LLM API client. Speaks the /v1/ protocol supported by all major backends."""
-import asyncio
-
-import httpx
+from typing import Protocol
 
 from .config import Config
 
-EMBED_BATCH_SIZE = 64
-RETRY_ATTEMPTS = 3
-RETRY_DELAY = 2
-RETRYABLE_STATUSES = (429, 502, 503, 504)
+
+class Embedder(Protocol):
+    def embed(self, texts: list[str]) -> list[list[float]]: ...
 
 
-async def embed(cfg: Config, http: httpx.AsyncClient, texts: list[str]) -> list[list[float]]:
-    """Embeds texts in batches to respect API limits."""
-    all_vectors: list[list[float]] = []
-    total = len(texts)
-    for offset in range(0, total, EMBED_BATCH_SIZE):
-        batch = texts[offset: offset + EMBED_BATCH_SIZE]
-        vectors = await _embed_batch(cfg, http, batch)
-        all_vectors.extend(vectors)
-        done = min(offset + EMBED_BATCH_SIZE, total)
-        print(f"\r  embed {done}/{total}", end="", flush=True)
-    if total > EMBED_BATCH_SIZE:
-        print()
-    return all_vectors
+class LLM(Protocol):
+    def chat(self, system: str | None, user: str) -> str: ...
 
 
-async def _embed_batch(cfg: Config, http: httpx.AsyncClient, texts: list[str]) -> list[list[float]]:
-    url = f"{cfg.embedder_url}/v1/embeddings"
-    body = {"model": cfg.embedder_model, "input": texts}
-    res = await _post(http, url, cfg.api_key, body)
-    try:
-        data = sorted(res["data"], key=lambda d: d["index"])
-        return [d["embedding"] for d in data]
-    except (KeyError, TypeError, IndexError) as exc:
-        raise RuntimeError(f"unexpected embed response from {url}: {exc}") from exc
+@dataclass
+class Models:
+    embedder: Embedder
+    llm: LLM
 
+    @staticmethod
+    def load(cfg: Config) -> "Models":
+        if cfg.backend == "cloud":
+            from .backend_cloud import load
+            embedder, llm = load(cfg.cloud_base_url, cfg.cloud_api_key, cfg.cloud_embed_model, cfg.cloud_inference_model)
+        else:
+            from .backend_local import load
+            embedder, llm = load(cfg.embed_model_path, cfg.inference_model_path)
 
-async def chat(cfg: Config, http: httpx.AsyncClient, system: str | None, user: str) -> str:
-    messages: list[dict[str, str]] = []
-    if system is not None:
-        messages.append({"role": "system", "content": system})
-    messages.append({"role": "user", "content": user})
-
-    url = f"{cfg.inference_url}/v1/chat/completions"
-    body = {"model": cfg.inference_model, "messages": messages}
-    res = await _post(http, url, cfg.api_key, body)
-    try:
-        return res["choices"][0]["message"]["content"]
-    except (KeyError, TypeError, IndexError) as exc:
-        raise RuntimeError(f"unexpected chat response from {url}: {exc}") from exc
-
-
-async def _post(http: httpx.AsyncClient, url: str, api_key: str, body: dict) -> dict:
-    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-    last_err: Exception | None = None
-
-    for attempt in range(RETRY_ATTEMPTS):
-        try:
-            res = await http.post(url, headers=headers, json=body, timeout=300.0)
-        except httpx.TimeoutException as exc:
-            last_err = exc
-            if attempt < RETRY_ATTEMPTS - 1:
-                await asyncio.sleep(RETRY_DELAY)
-                continue
-            raise RuntimeError(f"API timed out after {RETRY_ATTEMPTS} attempts ({url})") from exc
-        except httpx.ConnectError as exc:
-            last_err = exc
-            if attempt < RETRY_ATTEMPTS - 1:
-                await asyncio.sleep(RETRY_DELAY)
-                continue
-            raise RuntimeError(f"API unreachable after {RETRY_ATTEMPTS} attempts ({url})") from exc
-
-        if res.status_code in RETRYABLE_STATUSES and attempt < RETRY_ATTEMPTS - 1:
-            last_err = RuntimeError(f"API {res.status_code}")
-            await asyncio.sleep(RETRY_DELAY)
-            continue
-
-        if res.status_code >= 400:
-            raise RuntimeError(f"API {res.status_code} from {url}: {res.text[:200]}")
-
-        return res.json()
-
-    raise RuntimeError(f"API failed after {RETRY_ATTEMPTS} attempts ({url}): {last_err}")
+        return Models(embedder=embedder, llm=llm)
 
 # ═══════════════════════════════════════════
-# arke/presets.py
-# ═══════════════════════════════════════════
-
-from dataclasses import replace
-from itertools import product
-
-from .config import Config
-
-FAST = "fast"
-MEDIUM = "medium"
-THOROUGH = "thorough"
-
-
-def get_preset(level: str, base: Config) -> list[Config]:
-    """Expands a sweep level into concrete configs with all parameter combinations."""
-    if level == FAST:
-        return _expand(
-            base,
-            chunk_sizes=[base.chunk_size],
-            overlaps=[base.overlap],
-            alphas=[base.alpha],
-            ks=[base.k],
-        )
-    if level == MEDIUM:
-        return _expand(
-            base,
-            chunk_sizes=[base.chunk_size],
-            overlaps=[base.overlap],
-            alphas=[0.0, 0.3, 0.5, 0.7, 1.0],
-            ks=[5, 10, 20],
-        )
-    if level == THOROUGH:
-        return _expand(
-            base,
-            chunk_sizes=[500, 1000],
-            overlaps=[0.0, 0.2],
-            alphas=[0.0, 0.3, 0.5, 0.7, 1.0],
-            ks=[5, 10, 20],
-        )
-
-    raise ValueError(f"unknown sweep level: {level} (expected: {FAST} | {MEDIUM} | {THOROUGH})")
-
-
-def _expand(
-    base: Config,
-    chunk_sizes: list[int],
-    overlaps: list[float],
-    alphas: list[float],
-    ks: list[int],
-) -> list[Config]:
-    out: list[Config] = []
-    for chunk_size, overlap, alpha, k in product(chunk_sizes, overlaps, alphas, ks):
-        cfg = replace(base, chunk_size=chunk_size, overlap=overlap, alpha=alpha, k=k)
-        out.append(cfg.resolved())
-    return out
-
-# ═══════════════════════════════════════════
-# arke/sdb.py
+# arke/server/sdb.py
 # ═══════════════════════════════════════════
 
 """Unified file-based store for all of Arke's cached state.
@@ -1109,142 +1952,61 @@ def wipe(table: str) -> None:
         shutil.rmtree(table_dir)
 
 # ═══════════════════════════════════════════
-# arke/sweep.py
+# arke/server/space.py
 # ═══════════════════════════════════════════
 
+"""Space — an isolated container for all Arke state.
+
+Each space has its own sdb root and its own config. Switching spaces
+is just calling mount() with a different name — the old in-memory
+objects become invalid, the new space's disk state takes over.
+
+Layout:
+    <home>/<name>/
+        config.json    — chunk params, model, source_dirs
+        data/          — sdb root (documents, chunks, embeddings, sessions)
+"""
+from __future__ import annotations
+
+import shutil
 from dataclasses import dataclass
+from pathlib import Path
 
-from . import Arke
-from .config import Config
-from .models import embed
-from .types import Chunk, SearchHit
-from .cache import Cache, corpus_hash
-from .digest import digest
-from .gen import make_cases, EvalCase
-from .presets import get_preset
+from . import sdb
+
+ARKE_HOME = Path("~/.arke")
 
 
 @dataclass(frozen=True)
-class SweepRow:
-    cfg: Config
-    metrics: EvalMetrics
+class Space:
+    name: str
+    path: Path
+
+    @property
+    def data(self) -> Path:
+        return self.path / "data"
+
+    @property
+    def config_path(self) -> Path:
+        return self.path / "config.json"
+
+    def wipe(self) -> None:
+        """Erase all indexed data. Config is preserved."""
+        if self.data.exists():
+            shutil.rmtree(self.data)
+        sdb.mount(self.data)
 
 
-@dataclass(frozen=True)
-class EvalResult:
-    hits: list[SearchHit]
-    expected_ids: list[str]
-
-
-@dataclass(frozen=True)
-class EvalMetrics:
-    precision: float
-    recall: float
-    mrr: float  # Mean Reciprocal Rank: 1 / position of first correct result
-
-
-async def run_sweep(base_cfg: Config, level: str, limit: int) -> list[SweepRow]:
-    source_path = digest(base_cfg.data_path)
-
-    configs = get_preset(level, base_cfg)
-    rows: list[SweepRow] = []
-    chash = corpus_hash(source_path)
-
-    for idx, cfg in enumerate(configs):
-        async with Arke(cfg) as m:
-            await m.reset()
-            await _ensure_chunks(m, chash, cfg, source_path)
-            cases = await _ensure_cases(m, chash, cfg, limit)
-
-            queries = [c.query for c in cases]
-            vectors = await embed(m.cfg, m.http, queries)
-
-            results: list[EvalResult] = []
-            for i, case in enumerate(cases):
-                hits = await m.db.search(cfg, vectors[i], case.query)
-                results.append(EvalResult(hits=hits, expected_ids=case.expected_ids))
-
-            metrics = _score(results)
-            rows.append(SweepRow(cfg=cfg, metrics=metrics))
-            print(
-                f"  eval {idx + 1}/{len(configs)}: chunk={cfg.chunk_size} overlap={cfg.overlap} alpha={cfg.alpha:.1f} k={cfg.k}")
-
-    rows.sort(key=lambda r: r.metrics.mrr, reverse=True)
-    _print_table(rows)
-    return rows
-
-
-async def _ensure_chunks(m: Arke, chash: str, cfg: Config, source_path: str) -> None:
-    cache = Cache(corpus=chash, chunk_size=cfg.chunk_size, overlap=cfg.overlap, embedder=cfg.embedder_model)
-    cached = cache.load()
-    if cached is not None:
-        chunks = [Chunk.from_dict(d) for d in cached]
-        await m.db.insert(chunks)
-        print(f"cache hit: {len(chunks)} chunks from disk")
-    else:
-        await m.ingest(source_path)
-        chunks = await m.db.fetch_all()
-        cache.save([c.to_dict() for c in chunks])
-
-
-async def _ensure_cases(m: Arke, chash: str, cfg: Config, limit: int) -> list[EvalCase]:
-    cache = Cache(corpus=chash, chunk_size=cfg.chunk_size, overlap=cfg.overlap, inference=cfg.inference_model)
-    cached = cache.load()
-    if cached is not None:
-        cases = [EvalCase(query=c["query"], expected_ids=c["expected_ids"]) for c in cached]
-        print(f"cache hit: {len(cases)} eval cases from disk")
-        return cases
-
-    cases = await make_cases(m, limit)
-    cache.save([{"query": c.query, "expected_ids": c.expected_ids} for c in cases])
-    return cases
-
-
-def _score(results: list[EvalResult]) -> EvalMetrics:
-    """Averages precision, recall and MRR across eval results."""
-    n = len(results)
-
-    if n == 0:
-        return EvalMetrics(precision=0.0, recall=0.0, mrr=0.0)
-
-    sum_p = 0.0
-    sum_r = 0.0
-    sum_rr = 0.0
-
-    for r in results:
-        expected = set(r.expected_ids)
-        matched = sum(1 for h in r.hits if h.chunk.id in expected)
-
-        sum_p += matched / len(r.hits) if r.hits else 0.0
-        sum_r += matched / len(expected) if expected else 0.0
-
-        for i, h in enumerate(r.hits):
-            if h.chunk.id in expected:
-                sum_rr += 1.0 / (i + 1)
-                break
-
-    return EvalMetrics(precision=sum_p / n, recall=sum_r / n, mrr=sum_rr / n)
-
-
-def _print_table(rows: list[SweepRow]) -> None:
-    header = f"{'chunk':>6} {'overlap':>7} {'alpha':>6} {'k':>4} {'prec':>7} {'recall':>7} {'MRR':>7}"
-    print(f"\n{'Sweep Results (sorted by MRR)':^50}")
-    print(header)
-    print("-" * len(header))
-
-    best_mrr = rows[0].metrics.mrr if rows else 0
-    for r in rows:
-        mrr_str = f"{r.metrics.mrr:.3f}"
-        if r.metrics.mrr == best_mrr:
-            mrr_str = f"{mrr_str} <-- best"
-        print(
-            f"{r.cfg.chunk_size:>6} {r.cfg.overlap:>7.1f} {r.cfg.alpha:>6.1f} {r.cfg.k:>4}"
-            f" {r.metrics.precision:>7.3f} {r.metrics.recall:>7.3f} {mrr_str:>7}"
-        )
-    print()
+def mount(name: str, home: str | Path = ARKE_HOME) -> Space:
+    """Mount a space by name. Sets the sdb root. Config is loaded separately."""
+    path = Path(home).expanduser() / "dataspaces" / name
+    path.mkdir(parents=True, exist_ok=True)
+    space = Space(name=name, path=path)
+    sdb.mount(space.data)
+    return space
 
 # ═══════════════════════════════════════════
-# arke/types.py
+# arke/server/types.py
 # ═══════════════════════════════════════════
 
 import hashlib
@@ -1356,14 +2118,14 @@ class SearchAnswer:
 [project]
 name = "arke-terminal"
 version = "0.1.163"
-description = "Local-first RAG with built-in eval."
+description = "Local-first RAG for legal teams."
 requires-python = ">=3.12"
 license = "MIT"
 authors = [
     { name = "Pavel Dolgoter", email = "mikepromogratus@proton.me" },
 ]
 readme = "README.md"
-keywords = ["rag", "eval", "search", "embeddings", "pgvector", "local"]
+keywords = ["rag", "search", "embeddings", "legal", "local"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -1373,26 +2135,30 @@ classifiers = [
 ]
 dependencies = [
     "python-dotenv>=1.0",
-    "asyncpg>=0.29",
-    "pgvector>=0.3",
-    "httpx>=0.27",
     "numpy>=2.0",
     "click>=8.1",
-    "fastapi>=0.115",
-    "uvicorn>=0.34",
+    "llama-cpp-python>=0.3",
+    "pdfplumber>=0.11",
+    "python-docx>=1.1",
+    "extract-msg>=0.48",
+    "msal>=1.36.0",
+    "httpx>=0.28.1",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
-    "pytest-asyncio>=0.23",
 ]
 
 [project.urls]
 Repository = "https://github.com/padolgot/arke-terminal"
 
 [project.scripts]
-arke = "arke.cli:main"
+arke-server  = "arke.server.main:run"
+arke-gateway = "arke.clients.socket:run"
+arke         = "arke.clients.cli:main"
+arke-eval    = "arke.eval.sweep:run"
+arke-mail    = "arke.clients.email:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -1405,18 +2171,5 @@ packages = ["arke"]
 # .env.example
 # ═══════════════════════════════════════════
 
-DATABASE_URL=postgresql://postgres@localhost:5432/arke
 
-# Path to corpus. Local directory with .txt/.jsonl, or URL (auto-downloads LegalBench-RAG).
-DATA_PATH=https://www.dropbox.com/scl/fo/r7xfa5i3hdsbxex1w6amw/AID389Olvtm-ZLTKAPrw6k4?rlkey=5n8zrbk4c08lbit3iiexofmwg&st=0hu354cq&dl=1
-
-# API key for cloud providers. Leave empty for local (Ollama, vLLM).
 API_KEY=
-
-# Override defaults (Ollama localhost with bge-m3 / llama3).
-# Works with any /v1/-compatible API (Ollama, vLLM, etc).
-# EMBEDDER_URL=http://localhost:11434
-# EMBEDDER_MODEL=bge-m3
-# EMBEDDING_DIM=1024
-# INFERENCE_URL=http://localhost:11434
-# INFERENCE_MODEL=llama3:8b-instruct-q4_K_M
