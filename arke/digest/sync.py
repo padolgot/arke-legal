@@ -122,7 +122,8 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     workspace_name = os.environ.get("ARKE_WORKSPACE", "default")
-    workspace_path = Path.home() / ".arke" / "workspaces" / workspace_name
+    arke_root = Path(os.environ.get("ARKE_ROOT") or Path.home() / ".arke")
+    workspace_path = arke_root / "workspaces" / workspace_name
     workspace_path.mkdir(parents=True, exist_ok=True)
 
     raw_sources = os.environ.get("ARKE_SOURCES", "").strip()

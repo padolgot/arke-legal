@@ -1,12 +1,15 @@
 [Unit]
 Description=Arke Mail — M365 email adapter
-After=network-online.target arke-server.service
+After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-EnvironmentFile=/etc/arke/arke.env
-ExecStart=arke-mail
+User=arke
+Group=arke
+WorkingDirectory=/opt/arke/src
+EnvironmentFile=/opt/arke/config/arke.env
+ExecStart=/opt/arke/src/.venv/bin/arke-mail
 Restart=on-failure
 RestartSec=5s
 StartLimitBurst=5
