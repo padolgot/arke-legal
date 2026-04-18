@@ -34,13 +34,12 @@ No Docker. No Postgres. No Ollama daemon.
 
 **Email (Microsoft 365)**
 
-Arke connects to a shared mailbox via Graph API webhooks. A lawyer sends a question to `ask@yourfirm.legal`, Arke replies with an answer and citations. Runs with `arke-mail`.
+Arke polls a shared mailbox via Graph API every few seconds. A lawyer sends a question to `ask@yourfirm.legal`, Arke replies with an answer and citations. Runs with `arke-mail`.
 
-Requires: Azure AD app registration, `cloudflared` tunnel for the webhook endpoint.
+Requires: Azure AD app registration (no public ingress — outbound HTTPS only).
 
 ```
-M365_TENANT_ID, M365_CLIENT_ID, M365_CLIENT_SECRET
-M365_MAILBOX, M365_WEBHOOK_URL
+M365_TENANT_ID, M365_CLIENT_ID, M365_CLIENT_SECRET, M365_MAILBOX
 ```
 
 **Terminal**

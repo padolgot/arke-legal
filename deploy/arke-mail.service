@@ -15,8 +15,5 @@ RestartSec=5s
 StartLimitBurst=5
 StartLimitIntervalSec=60
 
-# arke-mail may spawn `cloudflared` as a child (CLOUDFLARED_TUNNEL=<name>).
-# control-group kill is the default — it reaps the tunnel along with the parent.
-
 [Install]
 WantedBy=multi-user.target

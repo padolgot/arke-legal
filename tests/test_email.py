@@ -1,7 +1,7 @@
 import httpx
 import pytest
 
-from arke.clients.email import EmailConfig, _SeenIds, _send, process_message
+from arke.clients.email import EmailConfig, _send, list_unread_ids, process_message
 
 
 _ENV_KEYS = [
@@ -9,8 +9,6 @@ _ENV_KEYS = [
     "M365_CLIENT_ID",
     "M365_CLIENT_SECRET",
     "M365_MAILBOX",
-    "M365_WEBHOOK_URL",
-    "M365_WEBHOOK_PORT",
 ]
 
 
@@ -26,12 +24,11 @@ def test_from_env_requires_tenant_id(clean_env: pytest.MonkeyPatch) -> None:
         EmailConfig.from_env()
 
 
-def test_from_env_requires_webhook_url(clean_env: pytest.MonkeyPatch) -> None:
+def test_from_env_requires_mailbox(clean_env: pytest.MonkeyPatch) -> None:
     clean_env.setenv("M365_TENANT_ID", "tid")
     clean_env.setenv("M365_CLIENT_ID", "cid")
     clean_env.setenv("M365_CLIENT_SECRET", "secret")
-    clean_env.setenv("M365_MAILBOX", "ask@arke.legal")
-    with pytest.raises(ValueError, match="M365_WEBHOOK_URL"):
+    with pytest.raises(ValueError, match="M365_MAILBOX"):
         EmailConfig.from_env()
 
 
@@ -40,16 +37,25 @@ def test_from_env_complete(clean_env: pytest.MonkeyPatch) -> None:
     clean_env.setenv("M365_CLIENT_ID", "cid")
     clean_env.setenv("M365_CLIENT_SECRET", "secret")
     clean_env.setenv("M365_MAILBOX", "ask@arke.legal")
-    clean_env.setenv("M365_WEBHOOK_URL", "https://x.trycloudflare.com")
 
     cfg = EmailConfig.from_env()
 
     assert cfg.tenant_id == "tid"
     assert cfg.mailbox == "ask@arke.legal"
-    assert cfg.webhook_port == 8080
 
 
-def test_process_message_echoes_and_marks_read(
+def test_list_unread_ids_returns_ids_in_order() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert "isRead+eq+false" in str(request.url) or "isRead%20eq%20false" in str(request.url)
+        return httpx.Response(200, json={"value": [{"id": "m1"}, {"id": "m2"}, {"id": "m3"}]})
+
+    transport = httpx.MockTransport(handler)
+    with httpx.Client(transport=transport) as http:
+        ids = list_unread_ids(http, "token", "ask@arke.legal")
+    assert ids == ["m1", "m2", "m3"]
+
+
+def test_process_message_marks_read_before_reply(
     tmp_path: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr("arke.server.mailbox.send", lambda req, ws: "mid1")
@@ -79,10 +85,8 @@ def test_process_message_echoes_and_marks_read(
         process_message(http, "fake-token", "ask@arke.legal", "msg1", tmp_path)
 
     methods = [m for m, _ in calls]
-    assert methods.count("GET") == 1
-    assert methods.count("POST") == 1
-    assert methods.count("PATCH") == 1
-    assert any(p.endswith("/reply") for m, p in calls if m == "POST")
+    assert methods == ["GET", "PATCH", "POST"]
+    assert calls[-1][1].endswith("/reply")
 
 
 def test_process_message_handles_missing_fields(
@@ -102,21 +106,6 @@ def test_process_message_handles_missing_fields(
     transport = httpx.MockTransport(handler)
     with httpx.Client(transport=transport) as http:
         process_message(http, "fake-token", "ask@arke.legal", "msg1", tmp_path)
-
-
-def test_seen_ids_first_sighting_records() -> None:
-    seen = _SeenIds()
-    assert seen.check_and_add("a") is False
-    assert seen.check_and_add("a") is True
-
-
-def test_seen_ids_evicts_oldest_when_full() -> None:
-    seen = _SeenIds(max_size=2)
-    seen.check_and_add("a")
-    seen.check_and_add("b")
-    seen.check_and_add("c")  # evicts "a"
-    assert seen.check_and_add("a") is False  # gone, treated as new
-    assert seen.check_and_add("c") is True   # still within window
 
 
 def test_send_returns_immediately_on_success() -> None:
