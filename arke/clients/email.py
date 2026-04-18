@@ -1,34 +1,36 @@
 """Email client via Microsoft Graph webhooks.
 
-Steps covered: auth with Azure AD client credentials, Graph subscription
-against the shared mailbox, echo reply to any new email. Arke RAG is wired
-separately through arke.server.mailbox.
+Graph subscription on a shared mailbox; new mail → fetch → ask arke-server
+→ reply. RAG lives behind a file-based inbox/outbox, not imported here.
 
-Setup (two terminals):
-    $ cloudflared tunnel --url http://localhost:8080
-    # copy the printed https://<slug>.trycloudflare.com URL into
-    # M365_WEBHOOK_URL in .env, then:
-    $ arke-mail
+Public ingress:
+- demo: CLOUDFLARED_QUICK=1 — we spawn `cloudflared tunnel --url ...` as a
+  child, tail its log for the generated trycloudflare.com URL, feed that to
+  Graph as the webhook endpoint.
+- prod: M365_WEBHOOK_URL=https://... — Caddy or similar already terminates
+  TLS on a stable domain, we don't touch cloudflared.
 
-The webhook server runs on a daemon thread so Graph can validate the
-URL synchronously during subscription creation (Graph holds the POST
-open until our endpoint echoes back the validationToken). Everything
-else — subscription lifecycle, renewal, shutdown — lives in the main
-thread as a plain synchronous loop.
+The webhook server runs on a daemon thread because Graph validates the URL
+synchronously during subscription creation — it holds the POST open until
+our endpoint echoes the validationToken.
 """
 
 import json
 import logging
 import os
+import re
 import secrets
 import signal
+import subprocess
+import tempfile
 import threading
 import time
 from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import httpx
@@ -48,8 +50,9 @@ class EmailConfig:
     client_id: str
     client_secret: str
     mailbox: str
-    webhook_url: str
+    webhook_url: str               # empty when cloudflared_quick is set — filled in at runtime
     webhook_port: int = 8080
+    cloudflared_quick: bool = False  # spawn a disposable trycloudflare.com tunnel
 
     @staticmethod
     def from_env() -> "EmailConfig":
@@ -59,13 +62,18 @@ class EmailConfig:
                 raise ValueError(f"email config: {key} is required")
             return value
 
+        cloudflared_quick = os.environ.get("CLOUDFLARED_QUICK", "").lower() in ("1", "true", "yes")
+
+        # webhook_url is required only when we don't spawn our own tunnel.
+        # Evaluated after the other req() calls so errors surface in a stable order.
         return EmailConfig(
             tenant_id=req("M365_TENANT_ID"),
             client_id=req("M365_CLIENT_ID"),
             client_secret=req("M365_CLIENT_SECRET"),
             mailbox=req("M365_MAILBOX"),
-            webhook_url=req("M365_WEBHOOK_URL"),
+            webhook_url="" if cloudflared_quick else req("M365_WEBHOOK_URL"),
             webhook_port=int(os.environ.get("M365_WEBHOOK_PORT", "8080")),
+            cloudflared_quick=cloudflared_quick,
         )
 
 
@@ -262,6 +270,55 @@ def _build_handler(
     return WebhookHandler
 
 
+_QUICK_URL_RE = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
+_QUICK_URL_TIMEOUT_SEC = 30
+
+
+def _spawn_cloudflared_quick(port: int) -> tuple[subprocess.Popen, str]:
+    """Spawn a disposable trycloudflare.com tunnel. No account, no DNS, no setup.
+
+    cloudflared writes a fresh `https://<slug>.trycloudflare.com` URL to its
+    log on startup — we tail the logfile until the URL appears. Using --logfile
+    keeps cloudflared off our stdout/stderr and avoids a drain thread on a pipe.
+    """
+    log_dir = Path(tempfile.mkdtemp(prefix="arke-cloudflared-"))
+    log_path = log_dir / "tunnel.log"
+    try:
+        proc = subprocess.Popen([
+            "cloudflared", "tunnel",
+            "--url", f"http://localhost:{port}",
+            "--logfile", str(log_path),
+            "--loglevel", "info",
+        ])
+    except FileNotFoundError as exc:
+        raise RuntimeError("cloudflared not found on PATH — install it or unset CLOUDFLARED_QUICK") from exc
+    logger.info("starting cloudflared quick tunnel → %s", log_path)
+
+    deadline = time.monotonic() + _QUICK_URL_TIMEOUT_SEC
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise RuntimeError(f"cloudflared exited early (code {proc.returncode})")
+        if log_path.exists():
+            match = _QUICK_URL_RE.search(log_path.read_text())
+            if match:
+                logger.info("tunnel URL: %s", match.group(0))
+                return proc, match.group(0)
+        time.sleep(0.5)
+
+    proc.terminate()
+    raise RuntimeError(f"cloudflared did not publish URL within {_QUICK_URL_TIMEOUT_SEC}s")
+
+
+def _terminate_cloudflared(proc: subprocess.Popen) -> None:
+    logger.info("stopping cloudflared")
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=2)
+
+
 def _install_term_handler() -> None:
     """Translate SIGTERM into KeyboardInterrupt so systemd/docker stop paths run
     the same finally block as Ctrl-C, deleting the Graph subscription cleanly.
@@ -292,8 +349,13 @@ def run(cfg: EmailConfig, workspace_path: "Path") -> None:
         server_thread.start()
         logger.info("listening on 127.0.0.1:%d", cfg.webhook_port)
 
+        tunnel: subprocess.Popen | None = None
         sub_id: str | None = None
         try:
+            if cfg.cloudflared_quick:
+                tunnel, public_url = _spawn_cloudflared_quick(cfg.webhook_port)
+                cfg = replace(cfg, webhook_url=public_url)
+
             token = acquire_token(msal_app)
             sub_id = create_subscription(http, token, cfg, client_state)
             logger.info("created subscription %s", sub_id)
@@ -310,6 +372,8 @@ def run(cfg: EmailConfig, workspace_path: "Path") -> None:
                     delete_subscription(http, acquire_token(msal_app), sub_id)
                 except Exception:
                     logger.exception("cleanup failed")
+            if tunnel is not None:
+                _terminate_cloudflared(tunnel)
             server.shutdown()
 
 

@@ -1,10 +1,12 @@
 [Unit]
-Description=Arke
+Description=Arke — RAG engine
 After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=arke
+EnvironmentFile=/etc/arke/arke.env
+ExecStart=arke-server
 Restart=on-failure
 RestartSec=5s
 StartLimitBurst=5

@@ -1,5 +1,6 @@
 import hashlib
 import logging
+import os
 import shutil
 import subprocess
 import time
@@ -91,3 +92,49 @@ def run(space: Path, sources: list[RcloneSource], interval: int = 60) -> None:
             logger.info("digest published")
 
         time.sleep(interval)
+
+
+def _parse_sources(raw: str) -> list[RcloneSource]:
+    """Parse ARKE_SOURCES. Format: 'name:remote,name2:remote2'.
+
+    'remote' is whatever rclone accepts — a local path (/srv/data) or a
+    configured rclone remote (gdrive:bucket/foo). We split on the first ':'
+    only, so remotes containing ':' survive intact.
+    """
+    sources: list[RcloneSource] = []
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        raw_name, sep, raw_remote = entry.partition(":")
+        name = raw_name.strip()
+        remote = raw_remote.strip()
+        if not sep or not name or not remote:
+            raise ValueError(f"bad source entry: {entry!r} (want 'name:remote')")
+        sources.append(RcloneSource(name, remote))
+    return sources
+
+
+def main() -> None:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+    workspace_name = os.environ.get("ARKE_WORKSPACE", "default")
+    workspace_path = Path.home() / ".arke" / "workspaces" / workspace_name
+    workspace_path.mkdir(parents=True, exist_ok=True)
+
+    raw_sources = os.environ.get("ARKE_SOURCES", "").strip()
+    if not raw_sources:
+        raise SystemExit("ARKE_SOURCES is required (e.g. 'bailii:/srv/bailii,matters:gdrive:matters')")
+    sources = _parse_sources(raw_sources)
+
+    interval = int(os.environ.get("ARKE_SYNC_INTERVAL", "60"))
+    logger.info("sync starting, workspace=%s, sources=%s, interval=%ds",
+                workspace_name, [s.name for s in sources], interval)
+    run(workspace_path, sources, interval)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,6 +1,6 @@
 [project]
 name = "arke-legal"
-version = "0.1.204"
+version = "0.1.209"
 description = "Local-first RAG for legal teams."
 requires-python = ">=3.12"
 license = "MIT"
@@ -42,6 +42,7 @@ arke-gateway = "arke.clients.socket:run"
 arke         = "arke.clients.cli:main"
 arke-eval    = "arke.eval.sweep:run"
 arke-mail    = "arke.clients.email:main"
+arke-sync    = "arke.digest.sync:main"
 
 [build-system]
 requires = ["hatchling"]

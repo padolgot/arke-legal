@@ -1,10 +1,11 @@
 [Unit]
-Description=Arke Sync Daemon
+Description=Arke Sync — rclone -> digest/
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
+EnvironmentFile=/etc/arke/arke.env
 ExecStart=arke-sync
 Restart=on-failure
 RestartSec=5s
@@ -13,4 +14,3 @@ StartLimitIntervalSec=60
 
 [Install]
 WantedBy=multi-user.target
-# Перевиновать в арке дайджест.

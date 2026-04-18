@@ -1,0 +1,19 @@
+[Unit]
+Description=Arke Mail — M365 email adapter
+After=network-online.target arke-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/arke/arke.env
+ExecStart=arke-mail
+Restart=on-failure
+RestartSec=5s
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+# arke-mail may spawn `cloudflared` as a child (CLOUDFLARED_QUICK=1).
+# control-group kill is the default — it reaps the tunnel along with the parent.
+
+[Install]
+WantedBy=multi-user.target
