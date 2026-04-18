@@ -55,6 +55,14 @@ HR_STYLE = "margin:24px 0;border:none;border-top:1px solid #ddd"
 SOURCES_HEADER_STYLE = "margin:0 0 12px 0"
 SOURCE_LABEL_STYLE = "margin:14px 0 4px 0"
 CITATION_QUOTE_STYLE = "margin:0 0 0 8px;padding:4px 12px;border-left:3px solid #ccc;color:#555"
+FOOTER_STYLE = "margin:28px 0 0 0;padding-top:12px;border-top:1px solid #eee;font-size:9.5pt;color:#888"
+
+FOOTER_HTML = (
+    "This is a public demo of Arke on UK case law "
+    "(BAILII &amp; landmark authorities). "
+    "Arke is private legal intelligence — it runs on your firm's server. "
+    "Your documents never leave your network."
+)
 
 
 @dataclass(frozen=True)
@@ -234,6 +242,7 @@ def _build_html_reply(answer_md: str, citations: list[dict]) -> str:
                 f'<blockquote style="{CITATION_QUOTE_STYLE}">{quote_html}</blockquote>'
             )
 
+    parts.append(f'<p style="{FOOTER_STYLE}">{FOOTER_HTML}</p>')
     parts.append("</div>")
     return "".join(parts)
 

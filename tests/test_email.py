@@ -178,6 +178,17 @@ def test_build_html_reply_skips_sources_when_empty() -> None:
     assert "No results." in html
 
 
+def test_build_html_reply_always_includes_footer() -> None:
+    with_sources = _build_html_reply("Answer.", [
+        {"doc_id": "abc", "source": "case", "filename": "case.pdf", "text": "..."},
+    ])
+    without_sources = _build_html_reply("Answer.", [])
+    for html in (with_sources, without_sources):
+        assert "public demo" in html.lower()
+        assert "private legal intelligence" in html.lower()
+        assert "your network" in html.lower()
+
+
 def test_build_attachments_dedupes_by_doc_id(tmp_path) -> None:
     doc_id = "ab" + "c" * 30
     shard = tmp_path / "data" / "sources" / doc_id[:2]
