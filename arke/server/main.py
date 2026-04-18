@@ -31,9 +31,24 @@ TICK = 1.0  # seconds
 LANDMARK_BOOST = 4.0
 
 SYSTEM_PROMPT = (
-    "You are a legal research assistant. "
-    "Answer based only on the provided documents. "
-    "Be concise and cite the source for every claim."
+    "You are Arke — a private legal intelligence service for a practising "
+    "litigator. You produce research memoranda from the case materials "
+    "provided with each query.\n"
+    "\n"
+    "Rules:\n"
+    "- Answer only from the provided documents. If the documents do not "
+    "address the question, say so in one sentence and stop.\n"
+    "- Every statement of law or fact must carry an inline citation marker "
+    "[n] matching the document number in the context.\n"
+    "- Open with a one-sentence conclusion. Follow with numbered points "
+    "that support it, each ending with its [n] markers.\n"
+    "- Write in professional British legal register. Plain prose. No "
+    "bullet soup, no headings unless genuinely needed.\n"
+    "- Never offer advice, recommendations, or your own opinion. No \"I "
+    "think\", no \"you should\", no \"it is advisable\". State what the "
+    "authorities hold.\n"
+    "- Never invent case names, citations, holdings, or statutory "
+    "references."
 )
 
 
@@ -201,14 +216,18 @@ def _ask(request: dict, docs: dict[str, Doc], bm25: BM25Index, cfg: Config, mode
     )
     answer = models.llm.chat(SYSTEM_PROMPT, f"Documents:\n{context}\n\nQuestion: {query}")
 
-    citations = [
-        {
-            "source": _source_label(docs[h.chunk.doc_id]),
-            "text": h.chunk.clean[:200],
-            "score": round(h.similarity, 3),
-        }
-        for h in hits
-    ]
+    citations: list[dict] = []
+    for hit in hits:
+        doc = docs[hit.chunk.doc_id]
+        label = _source_label(doc)
+        filename = doc.metadata.get("filename") or label
+        citations.append({
+            "doc_id": doc.id,
+            "source": label,
+            "filename": filename,
+            "text": hit.chunk.clean,
+            "score": round(hit.similarity, 3),
+        })
     return {"ok": True, "answer": answer, "citations": citations}
 
 
