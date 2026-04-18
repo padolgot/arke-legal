@@ -73,12 +73,17 @@ def _ingest(digest_path: Path, cfg: Config, models: Models, docs: dict[str, Doc]
     bm25.clear()
     model_key = cfg.embed_model_path or cfg.cloud_embed_model
 
-    for path in sorted(digest_path.rglob("*")):
-        if not path.is_file() or path.name.startswith("."):
-            continue
+    files = [p for p in sorted(digest_path.rglob("*")) if p.is_file() and not p.name.startswith(".")]
+    total_files = len(files)
+    logger.info("ingest start — %d files under %s", total_files, digest_path)
 
+    cached_total = 0
+    embedded_total = 0
+
+    for file_idx, path in enumerate(files, 1):
         result = loader.load_file(path, root=digest_path)
         if result is None:
+            logger.info("[%d/%d] skipped (unsupported): %s", file_idx, total_files, path.name)
             continue
 
         doc, text = result
@@ -86,22 +91,36 @@ def _ingest(digest_path: Path, cfg: Config, models: Models, docs: dict[str, Doc]
         sdb.put_bin("sources", doc.id, path.read_bytes())
 
         chunk_datas = chunker.chunk(text, cfg.chunk_size, cfg.overlap)
+        cached = 0
+        embedded = 0
         for i, cd in enumerate(chunk_datas):
             chunk = Chunk(doc_id=doc.id, chunk_index=i, clean=cd.clean, head=cd.head, tail=cd.tail)
 
-            if not chunk.load_embedding(model_key, "1"):
+            if chunk.load_embedding(model_key, "1"):
+                cached += 1
+            else:
                 vec = models.embedder.embed([chunk.overlapped()])[0]
                 chunk.embedding = np.array(vec, dtype=np.float32)
                 chunk.save_embedding(model_key, "1")
+                embedded += 1
 
             bm25.add(f"{doc.id}:{i}", chunk.overlapped())
             doc.chunks.append(chunk)
 
         doc.save()
         docs[doc.id] = doc
+        cached_total += cached
+        embedded_total += embedded
+        logger.info(
+            "[%d/%d] %s — %d chunks (%d cached, %d embedded)",
+            file_idx, total_files, path.name, len(chunk_datas), cached, embedded,
+        )
 
     bm25.build()
-    logger.info("ingest done — %d docs, %d chunks", len(docs), _chunk_count(docs))
+    logger.info(
+        "ingest done — %d docs, %d chunks (%d cached, %d embedded)",
+        len(docs), _chunk_count(docs), cached_total, embedded_total,
+    )
     return _dir_hash(digest_path)
 
 
