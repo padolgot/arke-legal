@@ -58,8 +58,7 @@ CITATION_QUOTE_STYLE = "margin:0 0 0 8px;padding:4px 12px;border-left:3px solid 
 FOOTER_STYLE = "margin:28px 0 0 0;padding-top:12px;border-top:1px solid #eee;font-size:9.5pt;color:#888"
 
 FOOTER_HTML = (
-    "This is a public demo of Arke on UK case law "
-    "(BAILII &amp; landmark authorities). "
+    "This is a public demo of Arke on UK case law (BAILII). "
     "Arke is private legal intelligence — it runs on your firm's server. "
     "Your documents never leave your network."
 )

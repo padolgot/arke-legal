@@ -1,5 +1,5 @@
 # Arke Terminal — Source Dump
-# Generated: 2026-04-18T22:51:46Z
+# Generated: 2026-04-18T23:03:17Z
 
 # ═══════════════════════════════════════════
 # README.md
@@ -203,8 +203,7 @@ CITATION_QUOTE_STYLE = "margin:0 0 0 8px;padding:4px 12px;border-left:3px solid 
 FOOTER_STYLE = "margin:28px 0 0 0;padding-top:12px;border-top:1px solid #eee;font-size:9.5pt;color:#888"
 
 FOOTER_HTML = (
-    "This is a public demo of Arke on UK case law "
-    "(BAILII &amp; landmark authorities). "
+    "This is a public demo of Arke on UK case law (BAILII). "
     "Arke is private legal intelligence — it runs on your firm's server. "
     "Your documents never leave your network."
 )
@@ -1705,8 +1704,6 @@ logger = logging.getLogger(__name__)
 
 TICK = 1.0  # seconds
 
-LANDMARK_BOOST = 4.0
-
 SYSTEM_PROMPT = (
     "You are Arke — a private legal intelligence service for a practising "
     "litigator. You produce research memoranda from the case materials "
@@ -1953,19 +1950,11 @@ def _hybrid_search(
     bm25_max = max(bm25_raw.values(), default=1.0)
     bm25_norm = {k: v / bm25_max for k, v in bm25_raw.items()} if bm25_max > 0 else {}
 
-    # per-chunk source boost — landmark cases outrank BAILII commentary
-    boosts: dict[str, float] = {}
-    for doc in docs.values():
-        factor = LANDMARK_BOOST if doc.source.startswith("landmarks/") else 1.0
-        for chunk in doc.chunks:
-            boosts[f"{chunk.doc_id}:{chunk.chunk_index}"] = factor
-
     # hybrid score
     all_keys = set(cosine) | set(bm25_norm)
     scored: list[tuple[str, float]] = []
     for key in all_keys:
-        base = alpha * cosine.get(key, 0.0) + (1 - alpha) * bm25_norm.get(key, 0.0)
-        score = base * boosts.get(key, 1.0)
+        score = alpha * cosine.get(key, 0.0) + (1 - alpha) * bm25_norm.get(key, 0.0)
         scored.append((key, score))
 
     scored.sort(key=lambda x: x[1], reverse=True)
@@ -2338,7 +2327,7 @@ def mount(name: str, home: str | Path = ARKE_HOME) -> Workspace:
 
 [project]
 name = "arke-legal"
-version = "0.1.215"
+version = "0.1.216"
 description = "Local-first RAG for legal teams."
 requires-python = ">=3.12"
 license = "MIT"
