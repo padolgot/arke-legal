@@ -85,12 +85,9 @@ def acquire_token(app: msal.ConfidentialClientApplication) -> str:
 
 
 def list_unread_ids(http: httpx.Client, token: str, mailbox: str) -> list[str]:
-    # Skip messages sent by the mailbox itself — a reply from arke-mail lands
-    # back in the same Inbox (sender == recipient for self-routed mails) and
-    # without this filter we would reply to our own replies forever.
     url = f"{GRAPH}/users/{mailbox}/mailFolders('inbox')/messages"
     params = {
-        "$filter": f"isRead eq false and from/emailAddress/address ne '{mailbox}'",
+        "$filter": "isRead eq false",
         "$select": "id",
         "$orderby": "receivedDateTime",
         "$top": str(LIST_PAGE_SIZE),
@@ -133,6 +130,14 @@ def process_message(
     sender = (msg.get("from") or {}).get("emailAddress", {}).get("address", "unknown")
     body_text = (msg.get("body") or {}).get("content", "").strip()
     logger.info("received: %s (from %s)", subject, sender)
+
+    # Self-routed mail (a reply we sent that came back to the same mailbox)
+    # must never trigger another reply — that is the infinite loop. Mark read
+    # and bail. Graph's $filter cannot combine isRead with a nested sender
+    # filter, so we handle this client-side.
+    if sender.lower() == mailbox.lower():
+        mark_as_read(http, token, mailbox, msg_id)
+        return
 
     query = body_text or subject
     arke_msg_id = arke_mailbox.send({"cmd": "ask", "query": query}, workspace_path)
