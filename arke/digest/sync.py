@@ -61,8 +61,8 @@ def run(space: Path, sources: list[RcloneSource], interval: int = 60) -> None:
         for source in sources:
             try:
                 source.sync_to(staging / source.name)
-            except Exception as e:
-                logger.warning("source %s failed: %s", source.name, e)
+            except Exception as exc:
+                logger.warning("source %s failed: %s", source.name, exc)
 
         current_hash = _dir_hash(staging)
         if current_hash != last_hash:

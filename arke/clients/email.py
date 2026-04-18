@@ -4,11 +4,11 @@ Graph subscription on a shared mailbox; new mail → fetch → ask arke-server
 → reply. RAG lives behind a file-based inbox/outbox, not imported here.
 
 Public ingress:
-- demo: CLOUDFLARED_QUICK=1 — we spawn `cloudflared tunnel --url ...` as a
-  child, tail its log for the generated trycloudflare.com URL, feed that to
-  Graph as the webhook endpoint.
-- prod: M365_WEBHOOK_URL=https://... — Caddy or similar already terminates
-  TLS on a stable domain, we don't touch cloudflared.
+- demo: CLOUDFLARED_TUNNEL=<name> — we spawn `cloudflared tunnel run <name>`
+  as a child. The named tunnel is created once via the Cloudflare CLI and
+  routes a stable DNS name (e.g. mail.arke.legal) to localhost. See setup.md.
+- prod: CLOUDFLARED_TUNNEL unset — Caddy terminates TLS on a public IP and
+  M365_WEBHOOK_URL points at that stable hostname directly.
 
 The webhook server runs on a daemon thread because Graph validates the URL
 synchronously during subscription creation — it holds the POST open until
@@ -18,16 +18,14 @@ our endpoint echoes the validationToken.
 import json
 import logging
 import os
-import re
 import secrets
 import signal
 import subprocess
-import tempfile
 import threading
 import time
 from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -42,6 +40,7 @@ GRAPH = "https://graph.microsoft.com/v1.0"
 SCOPE = ["https://graph.microsoft.com/.default"]
 SUBSCRIPTION_TTL_MIN = 60
 RENEWAL_INTERVAL_SEC = 50 * 60
+CLOUDFLARED_STARTUP_SEC = 5
 
 
 @dataclass(frozen=True)
@@ -50,9 +49,9 @@ class EmailConfig:
     client_id: str
     client_secret: str
     mailbox: str
-    webhook_url: str               # empty when cloudflared_quick is set — filled in at runtime
+    webhook_url: str
     webhook_port: int = 8080
-    cloudflared_quick: bool = False  # spawn a disposable trycloudflare.com tunnel
+    cloudflared_tunnel: str = ""  # named tunnel to spawn; empty = external ingress (prod)
 
     @staticmethod
     def from_env() -> "EmailConfig":
@@ -62,18 +61,14 @@ class EmailConfig:
                 raise ValueError(f"email config: {key} is required")
             return value
 
-        cloudflared_quick = os.environ.get("CLOUDFLARED_QUICK", "").lower() in ("1", "true", "yes")
-
-        # webhook_url is required only when we don't spawn our own tunnel.
-        # Evaluated after the other req() calls so errors surface in a stable order.
         return EmailConfig(
             tenant_id=req("M365_TENANT_ID"),
             client_id=req("M365_CLIENT_ID"),
             client_secret=req("M365_CLIENT_SECRET"),
             mailbox=req("M365_MAILBOX"),
-            webhook_url="" if cloudflared_quick else req("M365_WEBHOOK_URL"),
+            webhook_url=req("M365_WEBHOOK_URL"),
             webhook_port=int(os.environ.get("M365_WEBHOOK_PORT", "8080")),
-            cloudflared_quick=cloudflared_quick,
+            cloudflared_tunnel=os.environ.get("CLOUDFLARED_TUNNEL", ""),
         )
 
 
@@ -191,7 +186,7 @@ def mark_as_read(http: httpx.Client, token: str, mailbox: str, msg_id: str) -> N
 
 
 def process_message(
-    http: httpx.Client, token: str, mailbox: str, msg_id: str, workspace_path: "Path"
+    http: httpx.Client, token: str, mailbox: str, msg_id: str, workspace_path: Path
 ) -> None:
     from arke.server import mailbox as arke_mailbox
 
@@ -219,7 +214,7 @@ def _build_handler(
     msal_app: msal.ConfidentialClientApplication,
     cfg: EmailConfig,
     client_state: str,
-    workspace_path: "Path",
+    workspace_path: Path,
 ) -> type[BaseHTTPRequestHandler]:
     seen = _SeenIds()
 
@@ -270,43 +265,23 @@ def _build_handler(
     return WebhookHandler
 
 
-_QUICK_URL_RE = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
-_QUICK_URL_TIMEOUT_SEC = 30
+def _spawn_cloudflared(tunnel_name: str) -> subprocess.Popen:
+    """Spawn `cloudflared tunnel run <name>` and wait for it to dial out.
 
-
-def _spawn_cloudflared_quick(port: int) -> tuple[subprocess.Popen, str]:
-    """Spawn a disposable trycloudflare.com tunnel. No account, no DNS, no setup.
-
-    cloudflared writes a fresh `https://<slug>.trycloudflare.com` URL to its
-    log on startup — we tail the logfile until the URL appears. Using --logfile
-    keeps cloudflared off our stdout/stderr and avoids a drain thread on a pipe.
+    The named tunnel is provisioned once via the Cloudflare CLI (see setup.md);
+    credentials live in ~/.cloudflared/. We sleep 5s after starting so Graph's
+    synchronous webhook validation has a live ingress to hit.
     """
-    log_dir = Path(tempfile.mkdtemp(prefix="arke-cloudflared-"))
-    log_path = log_dir / "tunnel.log"
+    logger.info("starting cloudflared tunnel '%s'", tunnel_name)
     try:
-        proc = subprocess.Popen([
-            "cloudflared", "tunnel",
-            "--url", f"http://localhost:{port}",
-            "--logfile", str(log_path),
-            "--loglevel", "info",
-        ])
+        proc = subprocess.Popen(["cloudflared", "tunnel", "run", tunnel_name])
     except FileNotFoundError as exc:
-        raise RuntimeError("cloudflared not found on PATH — install it or unset CLOUDFLARED_QUICK") from exc
-    logger.info("starting cloudflared quick tunnel → %s", log_path)
+        raise RuntimeError("cloudflared not found on PATH — install it or unset CLOUDFLARED_TUNNEL") from exc
 
-    deadline = time.monotonic() + _QUICK_URL_TIMEOUT_SEC
-    while time.monotonic() < deadline:
-        if proc.poll() is not None:
-            raise RuntimeError(f"cloudflared exited early (code {proc.returncode})")
-        if log_path.exists():
-            match = _QUICK_URL_RE.search(log_path.read_text())
-            if match:
-                logger.info("tunnel URL: %s", match.group(0))
-                return proc, match.group(0)
-        time.sleep(0.5)
-
-    proc.terminate()
-    raise RuntimeError(f"cloudflared did not publish URL within {_QUICK_URL_TIMEOUT_SEC}s")
+    time.sleep(CLOUDFLARED_STARTUP_SEC)
+    if proc.poll() is not None:
+        raise RuntimeError(f"cloudflared exited early (code {proc.returncode})")
+    return proc
 
 
 def _terminate_cloudflared(proc: subprocess.Popen) -> None:
@@ -330,7 +305,7 @@ def _install_term_handler() -> None:
     signal.signal(signal.SIGTERM, handler)
 
 
-def run(cfg: EmailConfig, workspace_path: "Path") -> None:
+def run(cfg: EmailConfig, workspace_path: Path) -> None:
     logger.info("email client starting, mailbox=%s, webhook=%s", cfg.mailbox, cfg.webhook_url)
     _install_term_handler()
 
@@ -352,9 +327,8 @@ def run(cfg: EmailConfig, workspace_path: "Path") -> None:
         tunnel: subprocess.Popen | None = None
         sub_id: str | None = None
         try:
-            if cfg.cloudflared_quick:
-                tunnel, public_url = _spawn_cloudflared_quick(cfg.webhook_port)
-                cfg = replace(cfg, webhook_url=public_url)
+            if cfg.cloudflared_tunnel:
+                tunnel = _spawn_cloudflared(cfg.cloudflared_tunnel)
 
             token = acquire_token(msal_app)
             sub_id = create_subscription(http, token, cfg, client_state)
@@ -378,7 +352,6 @@ def run(cfg: EmailConfig, workspace_path: "Path") -> None:
 
 
 def main() -> None:
-    from pathlib import Path
     from dotenv import load_dotenv
 
     load_dotenv()
