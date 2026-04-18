@@ -37,7 +37,7 @@ dev = [
 Repository = "https://github.com/padolgot/arke-legal"
 
 [project.scripts]
-arke-server  = "arke.server.main:run"
+arke-server  = "arke.server.main:main"
 arke-gateway = "arke.clients.socket:run"
 arke         = "arke.clients.cli:main"
 arke-eval    = "arke.eval.sweep:run"

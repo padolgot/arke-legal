@@ -12,13 +12,14 @@ Layout:
 """
 from __future__ import annotations
 
+import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
 from . import sdb
 
-ARKE_HOME = Path("~/.arke")
+ARKE_HOME = Path(os.environ.get("ARKE_ROOT") or (Path.home() / ".arke"))
 
 
 @dataclass(frozen=True)

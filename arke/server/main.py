@@ -58,6 +58,14 @@ def run() -> None:
         time.sleep(TICK)
 
 
+def main() -> None:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    run()
+
+
 # --- ingest ------------------------------------------------------------------
 
 def _ingest(digest_path: Path, cfg: Config, models: Models, docs: dict[str, Doc], bm25: BM25Index) -> str:

@@ -1,5 +1,5 @@
 # Arke Terminal — Source Dump
-# Generated: 2026-04-18T20:02:51Z
+# Generated: 2026-04-18T20:23:05Z
 
 # ═══════════════════════════════════════════
 # README.md
@@ -1668,6 +1668,14 @@ def run() -> None:
         time.sleep(TICK)
 
 
+def main() -> None:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    run()
+
+
 # --- ingest ------------------------------------------------------------------
 
 def _ingest(digest_path: Path, cfg: Config, models: Models, docs: dict[str, Doc], bm25: BM25Index) -> str:
@@ -2148,13 +2156,14 @@ Layout:
 """
 from __future__ import annotations
 
+import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
 from . import sdb
 
-ARKE_HOME = Path("~/.arke")
+ARKE_HOME = Path(os.environ.get("ARKE_ROOT") or (Path.home() / ".arke"))
 
 
 @dataclass(frozen=True)
@@ -2195,7 +2204,7 @@ def mount(name: str, home: str | Path = ARKE_HOME) -> Workspace:
 
 [project]
 name = "arke-legal"
-version = "0.1.209"
+version = "0.1.213"
 description = "Local-first RAG for legal teams."
 requires-python = ">=3.12"
 license = "MIT"
@@ -2232,7 +2241,7 @@ dev = [
 Repository = "https://github.com/padolgot/arke-legal"
 
 [project.scripts]
-arke-server  = "arke.server.main:run"
+arke-server  = "arke.server.main:main"
 arke-gateway = "arke.clients.socket:run"
 arke         = "arke.clients.cli:main"
 arke-eval    = "arke.eval.sweep:run"
