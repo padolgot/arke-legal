@@ -1,7 +1,8 @@
 from dataclasses import dataclass
 
-# Strongest separators first. Empty string is the final fallback (per-character).
-SEPARATORS = ["\n\n", "\n", ". ", ", ", " ", ""]
+# Strongest separators first. If none of these break a piece below chunk_size,
+# we hard-wrap at character boundaries in _separate's final branch.
+SEPARATORS = ["\n\n", "\n", ". ", ", ", " "]
 
 
 @dataclass(frozen=True)
@@ -37,7 +38,7 @@ def chunk(text: str, chunk_size: int, overlap: float) -> list[ChunkData]:
 
 def _separate(text: str, chunk_size: int, depth: int = 0) -> list[str]:
     if depth >= len(SEPARATORS):
-        return [text]
+        return [text[i : i + chunk_size] for i in range(0, len(text), chunk_size)]
 
     sep = SEPARATORS[depth]
     parts = text.split(sep)

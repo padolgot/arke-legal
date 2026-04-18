@@ -28,6 +28,8 @@ logger = logging.getLogger(__name__)
 
 TICK = 1.0  # seconds
 
+LANDMARK_BOOST = 4.0
+
 SYSTEM_PROMPT = (
     "You are a legal research assistant. "
     "Answer based only on the provided documents. "
@@ -255,11 +257,19 @@ def _hybrid_search(
     bm25_max = max(bm25_raw.values(), default=1.0)
     bm25_norm = {k: v / bm25_max for k, v in bm25_raw.items()} if bm25_max > 0 else {}
 
+    # per-chunk source boost — landmark cases outrank BAILII commentary
+    boosts: dict[str, float] = {}
+    for doc in docs.values():
+        factor = LANDMARK_BOOST if doc.source.startswith("landmarks/") else 1.0
+        for chunk in doc.chunks:
+            boosts[f"{chunk.doc_id}:{chunk.chunk_index}"] = factor
+
     # hybrid score
     all_keys = set(cosine) | set(bm25_norm)
     scored: list[tuple[str, float]] = []
     for key in all_keys:
-        score = alpha * cosine.get(key, 0.0) + (1 - alpha) * bm25_norm.get(key, 0.0)
+        base = alpha * cosine.get(key, 0.0) + (1 - alpha) * bm25_norm.get(key, 0.0)
+        score = base * boosts.get(key, 1.0)
         scored.append((key, score))
 
     scored.sort(key=lambda x: x[1], reverse=True)
