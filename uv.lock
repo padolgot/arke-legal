@@ -24,8 +24,8 @@ wheels = [
 ]
 
 [[package]]
-name = "arke"
-version = "0.1.193"
+name = "arke-legal"
+version = "0.1.204"
 source = { editable = "." }
 dependencies = [
     { name = "click" },

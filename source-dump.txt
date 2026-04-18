@@ -1,5 +1,5 @@
 # Arke Terminal — Source Dump
-# Generated: 2026-04-17T23:57:27Z
+# Generated: 2026-04-18T10:55:16Z
 
 # ═══════════════════════════════════════════
 # README.md
@@ -307,8 +307,9 @@ def delete_subscription(http: httpx.Client, token: str, sub_id: str) -> None:
 
 def fetch_message(http: httpx.Client, token: str, mailbox: str, msg_id: str) -> dict:
     url = f"{GRAPH}/users/{mailbox}/messages/{msg_id}"
-    params = {"$select": "id,subject,from"}
-    r = _send(lambda: http.get(url, params=params, headers=_auth(token)))
+    params = {"$select": "id,subject,from,body"}
+    headers = {**_auth(token), "Prefer": 'outlook.body-content-type="text"'}
+    r = _send(lambda: http.get(url, params=params, headers=headers))
     r.raise_for_status()
     return r.json()
 
@@ -327,18 +328,27 @@ def mark_as_read(http: httpx.Client, token: str, mailbox: str, msg_id: str) -> N
     r.raise_for_status()
 
 
-def process_message(http: httpx.Client, token: str, mailbox: str, msg_id: str) -> None:
-    """Echo: fetch the message, reply with 'received: <subject>', mark read.
+def process_message(
+    http: httpx.Client, token: str, mailbox: str, msg_id: str, workspace_path: "Path"
+) -> None:
+    from arke.server import mailbox as arke_mailbox
 
-    RAG integration replaces the reply body and optionally routes through
-    arke.server.mailbox; wiring lives outside this function.
-    """
     msg = fetch_message(http, token, mailbox, msg_id)
     subject = msg.get("subject") or "(no subject)"
     sender = (msg.get("from") or {}).get("emailAddress", {}).get("address", "unknown")
+    body_text = (msg.get("body") or {}).get("content", "").strip()
     logger.info("received: %s (from %s)", subject, sender)
 
-    reply_to_message(http, token, mailbox, msg_id, f"received: {subject}")
+    query = body_text or subject
+    arke_msg_id = arke_mailbox.send({"cmd": "ask", "query": query}, workspace_path)
+    response = arke_mailbox.receive(arke_msg_id, workspace_path)
+
+    if response and response.get("ok"):
+        answer = response.get("answer", "No answer available.")
+    else:
+        answer = "Arke could not process your request at this time."
+
+    reply_to_message(http, token, mailbox, msg_id, answer)
     mark_as_read(http, token, mailbox, msg_id)
 
 
@@ -347,6 +357,7 @@ def _build_handler(
     msal_app: msal.ConfidentialClientApplication,
     cfg: EmailConfig,
     client_state: str,
+    workspace_path: "Path",
 ) -> type[BaseHTTPRequestHandler]:
     seen = _SeenIds()
 
@@ -390,7 +401,7 @@ def _build_handler(
                     logger.info("duplicate notification for %s, skipping", msg_id)
                     continue
                 try:
-                    process_message(http, token, cfg.mailbox, msg_id)
+                    process_message(http, token, cfg.mailbox, msg_id, workspace_path)
                 except httpx.HTTPError as exc:
                     logger.error("process %s failed: %s", msg_id, exc)
 
@@ -408,7 +419,7 @@ def _install_term_handler() -> None:
     signal.signal(signal.SIGTERM, handler)
 
 
-def run(cfg: EmailConfig) -> None:
+def run(cfg: EmailConfig, workspace_path: "Path") -> None:
     logger.info("email client starting, mailbox=%s, webhook=%s", cfg.mailbox, cfg.webhook_url)
     _install_term_handler()
 
@@ -420,7 +431,7 @@ def run(cfg: EmailConfig) -> None:
 
     with httpx.Client(timeout=30) as http:
         client_state = secrets.token_urlsafe(32)
-        handler_cls = _build_handler(http, msal_app, cfg, client_state)
+        handler_cls = _build_handler(http, msal_app, cfg, client_state, workspace_path)
         server = HTTPServer(("127.0.0.1", cfg.webhook_port), handler_cls)
 
         server_thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -449,11 +460,14 @@ def run(cfg: EmailConfig) -> None:
 
 
 def main() -> None:
+    from pathlib import Path
     from dotenv import load_dotenv
 
     load_dotenv()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    run(EmailConfig.from_env())
+    workspace_name = os.environ.get("ARKE_WORKSPACE", "default")
+    workspace_path = Path.home() / ".arke" / "workspaces" / workspace_name
+    run(EmailConfig.from_env(), workspace_path)
 
 
 if __name__ == "__main__":
@@ -927,14 +941,18 @@ def run(workspace: str, level: str, limit: int) -> list[SweepRow]:
     return rows
 
 
+def _ws_path(workspace: str) -> Path:
+    return Path.home() / ".arke" / "workspaces" / workspace
+
+
 def _generate_cases(workspace: str, cfg: Config, limit: int) -> list[EvalCase]:
     """Start server, sample chunks, generate questions, stop server."""
     proc = _start_server(workspace, cfg)
+    ws_path = _ws_path(workspace)
     try:
-        _wait_ready()
-        # ask server to sample chunks for case generation
-        msg_id = mailbox.send({"cmd": "sample", "limit": limit})
-        response = mailbox.receive(msg_id)
+        _wait_ready(ws_path)
+        msg_id = mailbox.send({"cmd": "sample", "limit": limit}, ws_path)
+        response = mailbox.receive(msg_id, ws_path)
         if not response or not response.get("ok"):
             raise RuntimeError(f"sample failed: {response}")
 
@@ -952,12 +970,13 @@ def _generate_cases(workspace: str, cfg: Config, limit: int) -> list[EvalCase]:
 
 def _run_row(workspace: str, cfg: Config, cases: list[EvalCase]) -> EvalMetrics:
     proc = _start_server(workspace, cfg)
+    ws_path = _ws_path(workspace)
     try:
-        _wait_ready()
+        _wait_ready(ws_path)
         results = []
         for case in cases:
-            msg_id = mailbox.send({"cmd": "ask", "query": case.query})
-            response = mailbox.receive(msg_id)
+            msg_id = mailbox.send({"cmd": "ask", "query": case.query}, ws_path)
+            response = mailbox.receive(msg_id, ws_path)
             hits = response.get("citations", []) if response and response.get("ok") else []
             results.append((hits, case.expected_key))
         return _score(results)
@@ -978,18 +997,14 @@ def _start_server(workspace: str, cfg: Config) -> subprocess.Popen:
     return proc
 
 
-def _wait_ready(timeout: float = 60.0) -> None:
+def _wait_ready(ws_path: Path, timeout: float = 60.0) -> None:
     """Poll ping until server responds or timeout."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            msg_id = mailbox.send({"cmd": "ping"})
-            response = mailbox.receive.__wrapped__(msg_id, poll_timeout=2.0) if hasattr(mailbox.receive, "__wrapped__") else None
-            # fallback: try direct file check
-            outbox = Path.home() / ".arke" / "outbox" / f"{msg_id}.json"
-            time.sleep(0.5)
-            if outbox.exists():
-                outbox.unlink(missing_ok=True)
+            msg_id = mailbox.send({"cmd": "ping"}, ws_path)
+            response = mailbox.receive(msg_id, ws_path)
+            if response and response.get("pong"):
                 return
         except Exception:
             pass

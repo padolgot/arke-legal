@@ -161,8 +161,9 @@ def delete_subscription(http: httpx.Client, token: str, sub_id: str) -> None:
 
 def fetch_message(http: httpx.Client, token: str, mailbox: str, msg_id: str) -> dict:
     url = f"{GRAPH}/users/{mailbox}/messages/{msg_id}"
-    params = {"$select": "id,subject,from"}
-    r = _send(lambda: http.get(url, params=params, headers=_auth(token)))
+    params = {"$select": "id,subject,from,body"}
+    headers = {**_auth(token), "Prefer": 'outlook.body-content-type="text"'}
+    r = _send(lambda: http.get(url, params=params, headers=headers))
     r.raise_for_status()
     return r.json()
 
@@ -181,18 +182,27 @@ def mark_as_read(http: httpx.Client, token: str, mailbox: str, msg_id: str) -> N
     r.raise_for_status()
 
 
-def process_message(http: httpx.Client, token: str, mailbox: str, msg_id: str) -> None:
-    """Echo: fetch the message, reply with 'received: <subject>', mark read.
+def process_message(
+    http: httpx.Client, token: str, mailbox: str, msg_id: str, workspace_path: "Path"
+) -> None:
+    from arke.server import mailbox as arke_mailbox
 
-    RAG integration replaces the reply body and optionally routes through
-    arke.server.mailbox; wiring lives outside this function.
-    """
     msg = fetch_message(http, token, mailbox, msg_id)
     subject = msg.get("subject") or "(no subject)"
     sender = (msg.get("from") or {}).get("emailAddress", {}).get("address", "unknown")
+    body_text = (msg.get("body") or {}).get("content", "").strip()
     logger.info("received: %s (from %s)", subject, sender)
 
-    reply_to_message(http, token, mailbox, msg_id, f"received: {subject}")
+    query = body_text or subject
+    arke_msg_id = arke_mailbox.send({"cmd": "ask", "query": query}, workspace_path)
+    response = arke_mailbox.receive(arke_msg_id, workspace_path)
+
+    if response and response.get("ok"):
+        answer = response.get("answer", "No answer available.")
+    else:
+        answer = "Arke could not process your request at this time."
+
+    reply_to_message(http, token, mailbox, msg_id, answer)
     mark_as_read(http, token, mailbox, msg_id)
 
 
@@ -201,6 +211,7 @@ def _build_handler(
     msal_app: msal.ConfidentialClientApplication,
     cfg: EmailConfig,
     client_state: str,
+    workspace_path: "Path",
 ) -> type[BaseHTTPRequestHandler]:
     seen = _SeenIds()
 
@@ -244,7 +255,7 @@ def _build_handler(
                     logger.info("duplicate notification for %s, skipping", msg_id)
                     continue
                 try:
-                    process_message(http, token, cfg.mailbox, msg_id)
+                    process_message(http, token, cfg.mailbox, msg_id, workspace_path)
                 except httpx.HTTPError as exc:
                     logger.error("process %s failed: %s", msg_id, exc)
 
@@ -262,7 +273,7 @@ def _install_term_handler() -> None:
     signal.signal(signal.SIGTERM, handler)
 
 
-def run(cfg: EmailConfig) -> None:
+def run(cfg: EmailConfig, workspace_path: "Path") -> None:
     logger.info("email client starting, mailbox=%s, webhook=%s", cfg.mailbox, cfg.webhook_url)
     _install_term_handler()
 
@@ -274,7 +285,7 @@ def run(cfg: EmailConfig) -> None:
 
     with httpx.Client(timeout=30) as http:
         client_state = secrets.token_urlsafe(32)
-        handler_cls = _build_handler(http, msal_app, cfg, client_state)
+        handler_cls = _build_handler(http, msal_app, cfg, client_state, workspace_path)
         server = HTTPServer(("127.0.0.1", cfg.webhook_port), handler_cls)
 
         server_thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -303,11 +314,14 @@ def run(cfg: EmailConfig) -> None:
 
 
 def main() -> None:
+    from pathlib import Path
     from dotenv import load_dotenv
 
     load_dotenv()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    run(EmailConfig.from_env())
+    workspace_name = os.environ.get("ARKE_WORKSPACE", "default")
+    workspace_path = Path.home() / ".arke" / "workspaces" / workspace_name
+    run(EmailConfig.from_env(), workspace_path)
 
 
 if __name__ == "__main__":

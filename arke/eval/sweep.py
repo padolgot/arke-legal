@@ -60,14 +60,18 @@ def run(workspace: str, level: str, limit: int) -> list[SweepRow]:
     return rows
 
 
+def _ws_path(workspace: str) -> Path:
+    return Path.home() / ".arke" / "workspaces" / workspace
+
+
 def _generate_cases(workspace: str, cfg: Config, limit: int) -> list[EvalCase]:
     """Start server, sample chunks, generate questions, stop server."""
     proc = _start_server(workspace, cfg)
+    ws_path = _ws_path(workspace)
     try:
-        _wait_ready()
-        # ask server to sample chunks for case generation
-        msg_id = mailbox.send({"cmd": "sample", "limit": limit})
-        response = mailbox.receive(msg_id)
+        _wait_ready(ws_path)
+        msg_id = mailbox.send({"cmd": "sample", "limit": limit}, ws_path)
+        response = mailbox.receive(msg_id, ws_path)
         if not response or not response.get("ok"):
             raise RuntimeError(f"sample failed: {response}")
 
@@ -85,12 +89,13 @@ def _generate_cases(workspace: str, cfg: Config, limit: int) -> list[EvalCase]:
 
 def _run_row(workspace: str, cfg: Config, cases: list[EvalCase]) -> EvalMetrics:
     proc = _start_server(workspace, cfg)
+    ws_path = _ws_path(workspace)
     try:
-        _wait_ready()
+        _wait_ready(ws_path)
         results = []
         for case in cases:
-            msg_id = mailbox.send({"cmd": "ask", "query": case.query})
-            response = mailbox.receive(msg_id)
+            msg_id = mailbox.send({"cmd": "ask", "query": case.query}, ws_path)
+            response = mailbox.receive(msg_id, ws_path)
             hits = response.get("citations", []) if response and response.get("ok") else []
             results.append((hits, case.expected_key))
         return _score(results)
@@ -111,18 +116,14 @@ def _start_server(workspace: str, cfg: Config) -> subprocess.Popen:
     return proc
 
 
-def _wait_ready(timeout: float = 60.0) -> None:
+def _wait_ready(ws_path: Path, timeout: float = 60.0) -> None:
     """Poll ping until server responds or timeout."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            msg_id = mailbox.send({"cmd": "ping"})
-            response = mailbox.receive.__wrapped__(msg_id, poll_timeout=2.0) if hasattr(mailbox.receive, "__wrapped__") else None
-            # fallback: try direct file check
-            outbox = Path.home() / ".arke" / "outbox" / f"{msg_id}.json"
-            time.sleep(0.5)
-            if outbox.exists():
-                outbox.unlink(missing_ok=True)
+            msg_id = mailbox.send({"cmd": "ping"}, ws_path)
+            response = mailbox.receive(msg_id, ws_path)
+            if response and response.get("pong"):
                 return
         except Exception:
             pass

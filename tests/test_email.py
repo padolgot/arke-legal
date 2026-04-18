@@ -49,7 +49,15 @@ def test_from_env_complete(clean_env: pytest.MonkeyPatch) -> None:
     assert cfg.webhook_port == 8080
 
 
-def test_process_message_echoes_and_marks_read() -> None:
+def test_process_message_echoes_and_marks_read(
+    tmp_path: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("arke.server.mailbox.send", lambda req, ws: "mid1")
+    monkeypatch.setattr(
+        "arke.server.mailbox.receive",
+        lambda mid, ws: {"ok": True, "answer": "Here is the answer."},
+    )
+
     calls: list[tuple[str, str]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -61,13 +69,14 @@ def test_process_message_echoes_and_marks_read() -> None:
                     "id": "msg1",
                     "subject": "hello",
                     "from": {"emailAddress": {"address": "client@firm.com"}},
+                    "body": {"content": "What is the case law on X?", "contentType": "text"},
                 },
             )
         return httpx.Response(202)
 
     transport = httpx.MockTransport(handler)
     with httpx.Client(transport=transport) as http:
-        process_message(http, "fake-token", "ask@arke.legal", "msg1")
+        process_message(http, "fake-token", "ask@arke.legal", "msg1", tmp_path)
 
     methods = [m for m, _ in calls]
     assert methods.count("GET") == 1
@@ -76,7 +85,15 @@ def test_process_message_echoes_and_marks_read() -> None:
     assert any(p.endswith("/reply") for m, p in calls if m == "POST")
 
 
-def test_process_message_handles_missing_fields() -> None:
+def test_process_message_handles_missing_fields(
+    tmp_path: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("arke.server.mailbox.send", lambda req, ws: "mid1")
+    monkeypatch.setattr(
+        "arke.server.mailbox.receive",
+        lambda mid, ws: {"ok": True, "answer": "No relevant documents found."},
+    )
+
     def handler(request: httpx.Request) -> httpx.Response:
         if request.method == "GET":
             return httpx.Response(200, json={"id": "msg1"})
@@ -84,7 +101,7 @@ def test_process_message_handles_missing_fields() -> None:
 
     transport = httpx.MockTransport(handler)
     with httpx.Client(transport=transport) as http:
-        process_message(http, "fake-token", "ask@arke.legal", "msg1")
+        process_message(http, "fake-token", "ask@arke.legal", "msg1", tmp_path)
 
 
 def test_seen_ids_first_sighting_records() -> None:
