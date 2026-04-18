@@ -85,9 +85,12 @@ def acquire_token(app: msal.ConfidentialClientApplication) -> str:
 
 
 def list_unread_ids(http: httpx.Client, token: str, mailbox: str) -> list[str]:
+    # Skip messages sent by the mailbox itself — a reply from arke-mail lands
+    # back in the same Inbox (sender == recipient for self-routed mails) and
+    # without this filter we would reply to our own replies forever.
     url = f"{GRAPH}/users/{mailbox}/mailFolders('inbox')/messages"
     params = {
-        "$filter": "isRead eq false",
+        "$filter": f"isRead eq false and from/emailAddress/address ne '{mailbox}'",
         "$select": "id",
         "$orderby": "receivedDateTime",
         "$top": str(LIST_PAGE_SIZE),
