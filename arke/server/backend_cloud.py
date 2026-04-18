@@ -1,9 +1,13 @@
 """Cloud backend — OpenAI API via HTTP."""
 import json
+import logging
+import urllib.error
 import urllib.request
 from dataclasses import dataclass
 
-EMBED_BATCH_SIZE = 64
+EMBED_BATCH_SIZE = 2048
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -16,10 +20,21 @@ class CloudEmbedder:
         result: list[list[float]] = []
         for offset in range(0, len(texts), EMBED_BATCH_SIZE):
             batch = texts[offset : offset + EMBED_BATCH_SIZE]
-            res = _post(self.base_url, self.api_key, "/v1/embeddings", {"model": self.model, "input": batch})
-            data = sorted(res["data"], key=lambda d: d["index"])
-            result.extend(d["embedding"] for d in data)
+            result.extend(self._embed_batch(batch))
         return result
+
+    def _embed_batch(self, batch: list[str]) -> list[list[float]]:
+        body = {"model": self.model, "input": batch}
+        try:
+            res = _post(self.base_url, self.api_key, "/v1/embeddings", body)
+        except urllib.error.HTTPError as e:
+            if e.code in (400, 413) and len(batch) > 1:
+                mid = len(batch) // 2
+                logger.warning("embed batch too large (HTTP %d, size %d) — halving", e.code, len(batch))
+                return self._embed_batch(batch[:mid]) + self._embed_batch(batch[mid:])
+            raise
+        data = sorted(res["data"], key=lambda d: d["index"])
+        return [d["embedding"] for d in data]
 
 
 @dataclass

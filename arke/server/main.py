@@ -91,20 +91,30 @@ def _ingest(digest_path: Path, cfg: Config, models: Models, docs: dict[str, Doc]
         sdb.put_bin("sources", doc.id, path.read_bytes())
 
         chunk_datas = chunker.chunk(text, cfg.chunk_size, cfg.overlap)
-        cached = 0
-        embedded = 0
-        for i, cd in enumerate(chunk_datas):
-            chunk = Chunk(doc_id=doc.id, chunk_index=i, clean=cd.clean, head=cd.head, tail=cd.tail)
+        chunks = [
+            Chunk(doc_id=doc.id, chunk_index=i, clean=cd.clean, head=cd.head, tail=cd.tail)
+            for i, cd in enumerate(chunk_datas)
+        ]
 
+        missing_idx: list[int] = []
+        missing_texts: list[str] = []
+        for i, chunk in enumerate(chunks):
             if chunk.load_embedding(model_key, "1"):
-                cached += 1
-            else:
-                vec = models.embedder.embed([chunk.overlapped()])[0]
-                chunk.embedding = np.array(vec, dtype=np.float32)
-                chunk.save_embedding(model_key, "1")
-                embedded += 1
+                continue
+            missing_idx.append(i)
+            missing_texts.append(chunk.overlapped())
 
-            bm25.add(f"{doc.id}:{i}", chunk.overlapped())
+        if missing_texts:
+            vecs = models.embedder.embed(missing_texts)
+            for idx, vec in zip(missing_idx, vecs):
+                chunks[idx].embedding = np.array(vec, dtype=np.float32)
+                chunks[idx].save_embedding(model_key, "1")
+
+        cached = len(chunks) - len(missing_texts)
+        embedded = len(missing_texts)
+
+        for chunk in chunks:
+            bm25.add(f"{doc.id}:{chunk.chunk_index}", chunk.overlapped())
             doc.chunks.append(chunk)
 
         doc.save()
@@ -184,16 +194,25 @@ def _ask(request: dict, docs: dict[str, Doc], bm25: BM25Index, cfg: Config, mode
         return {"ok": True, "answer": "No relevant documents found.", "citations": []}
 
     context = "\n\n".join(
-        f"[{i+1}] (source: {h.chunk.doc_id[:8]}) {h.chunk.clean}"
+        f"[{i+1}] (source: {_source_label(docs[h.chunk.doc_id])}) {h.chunk.clean}"
         for i, h in enumerate(hits)
     )
     answer = models.llm.chat(SYSTEM_PROMPT, f"Documents:\n{context}\n\nQuestion: {query}")
 
     citations = [
-        {"source": h.chunk.doc_id, "text": h.chunk.clean[:200], "score": round(h.similarity, 3)}
+        {
+            "source": _source_label(docs[h.chunk.doc_id]),
+            "text": h.chunk.clean[:200],
+            "score": round(h.similarity, 3),
+        }
         for h in hits
     ]
     return {"ok": True, "answer": answer, "citations": citations}
+
+
+def _source_label(doc: Doc) -> str:
+    filename = doc.metadata.get("filename") or doc.source or doc.id[:8]
+    return Path(filename).stem
 
 
 def _sample(request: dict, docs: dict[str, Doc]) -> dict:

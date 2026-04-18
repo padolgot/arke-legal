@@ -202,6 +202,10 @@ def process_message(
 
     if response and response.get("ok"):
         answer = response.get("answer", "No answer available.")
+        citations = response.get("citations", [])
+        if citations:
+            lines = [f"[{i+1}] {c['source']}" for i, c in enumerate(citations)]
+            answer += "\n\n---\nSources:\n" + "\n".join(lines)
     else:
         answer = "Arke could not process your request at this time."
 
