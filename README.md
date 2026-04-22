@@ -1,4 +1,4 @@
-# Arke Terminal
+# Arke
 
 AI document search for legal teams. Privilege-safe, on-premise.
 

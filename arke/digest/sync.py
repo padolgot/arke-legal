@@ -20,12 +20,24 @@ class RcloneSource:
 
     def sync_to(self, dest: Path) -> None:
         dest.mkdir(parents=True, exist_ok=True)
-        subprocess.run(
+        result = subprocess.run(
             ["rclone", "sync", self._remote, str(dest),
              "--timeout", "10m",
              "--contimeout", "60s"],
-            check=True,
         )
+        # exit 3 = rclone "directory not found" — source was deleted.
+        # Treat as empty: drop the local copy so stale data can't linger.
+        if result.returncode == 3:
+            shutil.rmtree(dest, ignore_errors=True)
+            return
+        result.check_returncode()
+
+
+def _purge_orphans(staging: Path, active: set[str]) -> None:
+    for child in staging.iterdir():
+        if child.is_dir() and child.name not in active:
+            logger.info("purging orphan source: %s", child.name)
+            shutil.rmtree(child)
 
 
 def _dir_hash(path: Path) -> str:
@@ -49,7 +61,16 @@ def _save_hash(space: Path, h: str) -> None:
 
 
 def run(space: Path, sources: list[RcloneSource], interval: int = 60) -> None:
-    """Sync loop. Blocks forever — call from a dedicated process."""
+    """Sync loop. Blocks forever — call from a dedicated process.
+
+    TODO robustness (ranked):
+      1. partial rclone sync → staging holds garbage, next hash publishes broken
+         digest. Per-source .synced marker or tmpdir-per-source + atomic swap.
+      2. disk full during staging → digest.tmp copytree → broken digest gets
+         published anyway. Check shutil.disk_usage before copytree.
+      3. mtime-based _dir_hash is fragile under clock skew / touch without
+         change. Content hash is accurate but costs O(corpus) per tick.
+    """
     staging = space / "staging"
     digest = space / "digest"
     staging.mkdir(parents=True, exist_ok=True)
@@ -63,6 +84,8 @@ def run(space: Path, sources: list[RcloneSource], interval: int = 60) -> None:
                 source.sync_to(staging / source.name)
             except Exception as exc:
                 logger.warning("source %s failed: %s", source.name, exc)
+
+        _purge_orphans(staging, {s.name for s in sources})
 
         current_hash = _dir_hash(staging)
         if current_hash != last_hash:

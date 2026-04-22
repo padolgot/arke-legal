@@ -407,6 +407,8 @@ def main() -> None:
 
     load_dotenv()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     workspace_name = os.environ.get("ARKE_WORKSPACE", "default")
     arke_root = Path(os.environ.get("ARKE_ROOT") or Path.home() / ".arke")
     workspace_path = arke_root / "workspaces" / workspace_name
