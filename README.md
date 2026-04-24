@@ -1,57 +1,55 @@
 # Arke
 
-AI document search for legal teams. Privilege-safe, on-premise.
+**Devil's advocate over your own data. Privately. Via email.**
 
-Cloud AI breaks attorney-client privilege (*United States v. Heppner*, *Hamid v SSHD*). Arke runs on your server. Your documents never leave your network.
+Arke reads your firm's corpus and answers your questions with direct citations — nothing else. No summarisation, no LLM paraphrase, no cloud round-trip. Built for litigators and dispute partners who want to stress-test their arguments against the counter-case already hiding in their own documents.
 
----
-
-## How it works
-
-Arke is a single Python process with two pipes.
-
-**Vertical pipe — digestion.** Drop documents into `digest/`. Arke detects the change, loads every file (PDF, DOCX, MSG, TXT), chunks and embeds it, keeps everything in memory and on local disk. On the next question, the answers are already there.
-
-**Horizontal pipe — query.** A question arrives — from email, terminal, or CLI. Arke embeds the query, runs hybrid search (cosine + BM25), passes the top results to the LLM, and returns a cited answer. No round-trips, no external services: the LLM runs in the same process via `llama-cpp-python`.
-
-The document is a seed on disk (plain JSON) and a tree in memory (chunks, embeddings, full text). The tree is always rebuilt from the seed. Nothing clever lives on disk.
+Arke never edits your documents — it only caches them, read-only. Worst case, you get a weak stress-test; your data stays on your server and never leaves your network. Best case, you have an always-available sparring partner stress-testing your arguments before court.
 
 ---
 
-## Install
+## How it's built
 
-```bash
-pip install arke-terminal
-cp .env.example .env   # fill in model paths or cloud API key
-arke-server            # start the engine
-```
+A single Python process. Three one-way pipes in the shape of a **T** with a hat.
 
-No Docker. No Postgres. No Ollama daemon.
+**Vertical — data.** Your source of truth (OneDrive, SharePoint, iManage, NetDocuments, or a local folder) is mirrored read-only into cold storage by hash. Arke never writes back. On start, changed documents bloom into RAM as chunks and embeddings.
+
+**Horizontal — signal.** A question arrives via email, TUI, or CLI — same mailbox, same pipe. It crosses the vertical at the RAM junction, picks up the citations it needs, and leaves as an answer in the outbox.
+
+**Eval loop.** A third pipe that feeds the T with LegalBench-RAG question/answer pairs and measures the output. The system sees itself and calibrates.
+
+**Citations are the answer.** The LLM doesn't speak for Arke — it only helps select the right quotes from your corpus. Arke is mute; it speaks through your documents.
+
+No Postgres. No Docker. No vector DB. No third-party framework. Everything lives in RAM while running and in plain JSON on disk.
 
 ---
 
 ## Interfaces
 
-**Email (Microsoft 365)**
+**Email** — primary. Self-hosted, on your server. A lawyer sends a question to `ask@yourfirm.legal`; Arke replies with citations.
 
-Arke polls a shared mailbox via Graph API every few seconds. A lawyer sends a question to `ask@yourfirm.legal`, Arke replies with an answer and citations. Runs with `arke-mail`.
-
-Requires: Azure AD app registration (no public ingress — outbound HTTPS only).
-
-```
-M365_TENANT_ID, M365_CLIENT_ID, M365_CLIENT_SECRET, M365_MAILBOX
+```bash
+arke-mail
 ```
 
-**Terminal**
+**TUI** — for the legal quant who wants to iterate fast on their own corpus, chat-style, like a coding agent.
+
+**CLI** — for other agents talking directly to the engine.
 
 ```bash
 arke ask "What are the termination clauses?"
 ```
 
-**Eval sweep** — find the best retrieval config (chunk size, overlap, alpha, k) by running MRR benchmarks across presets:
+**Eval sweep** — find the best retrieval config (chunk size, overlap, alpha, k) across presets:
 
 ```bash
-python -m arke.eval.sweep --space legalbench --level medium --limit 50
+arke-eval --space legalbench --level medium --limit 50
+```
+
+**Source sync** — one-way mirror of your document source into cold storage:
+
+```bash
+arke-sync
 ```
 
 ---
@@ -80,7 +78,7 @@ CLOUD_INFERENCE_MODEL=gpt-4o
 
 ## Input formats
 
-PDF, DOCX, MSG (Outlook), TXT, Markdown. Drop files into `digest/`, Arke picks them up automatically.
+PDF, DOCX, MSG (Outlook), TXT, Markdown.
 
 ---
 
@@ -95,3 +93,15 @@ All via environment variables (`.env`):
 | `OVERLAP` | `0.0` | Overlap fraction (0–0.5) |
 | `ALPHA` | `0.7` | Blend: 1.0 = pure semantic, 0.0 = pure keyword |
 | `K` | `5` | Top-k results passed to LLM |
+
+---
+
+## Getting it into your firm
+
+Arke is open source under MIT. Clone it, run it, own it.
+
+---
+
+## Public demo
+
+`ask@arke.legal` — a live instance running on the BAILII corpus of UK case law. Send a question, get stress-test back.
