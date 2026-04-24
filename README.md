@@ -56,23 +56,10 @@ arke-sync
 
 ## Backends
 
-| Backend | When to use |
-|---------|-------------|
-| `local` | Production. GPU server, `.gguf` models. Zero external calls. |
-| `cloud` | Eval and development. OpenAI-compatible API. |
-
-```bash
-# local
-BACKEND=local
-EMBED_MODEL_PATH=/models/nomic-embed.gguf
-INFERENCE_MODEL_PATH=/models/mistral.gguf
-
-# cloud
-BACKEND=cloud
-CLOUD_API_KEY=sk-...
-CLOUD_EMBED_MODEL=text-embedding-3-small
-CLOUD_INFERENCE_MODEL=gpt-4o
-```
+| Backend | When to use                                                    |
+|---------|----------------------------------------------------------------|
+| `local` | Production. GPU server, `.gguf` models. Zero external calls.   |
+| `cloud` | BAILII/LegalBench eval and development. OpenAI-compatible API. |
 
 ---
 
@@ -88,7 +75,7 @@ All via environment variables (`.env`):
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ARKE_SPACE` | `default` | Dataspace name (isolates documents per client) |
+| `ARKE_WORKSPACE` | `default` | Workspace name (isolates documents per client) |
 | `CHUNK_SIZE` | `600` | Characters per chunk |
 | `OVERLAP` | `0.0` | Overlap fraction (0–0.5) |
 | `ALPHA` | `0.7` | Blend: 1.0 = pure semantic, 0.0 = pure keyword |

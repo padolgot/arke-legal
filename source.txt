@@ -1,5 +1,5 @@
 # Arke Terminal — Source Dump
-# Generated: 2026-04-24T14:16:06Z
+# Generated: 2026-04-24T17:55:52Z
 
 # ═══════════════════════════════════════════
 # README.md
@@ -63,23 +63,10 @@ arke-sync
 
 ## Backends
 
-| Backend | When to use |
-|---------|-------------|
-| `local` | Production. GPU server, `.gguf` models. Zero external calls. |
-| `cloud` | Eval and development. OpenAI-compatible API. |
-
-```bash
-# local
-BACKEND=local
-EMBED_MODEL_PATH=/models/nomic-embed.gguf
-INFERENCE_MODEL_PATH=/models/mistral.gguf
-
-# cloud
-BACKEND=cloud
-CLOUD_API_KEY=sk-...
-CLOUD_EMBED_MODEL=text-embedding-3-small
-CLOUD_INFERENCE_MODEL=gpt-4o
-```
+| Backend | When to use                                                    |
+|---------|----------------------------------------------------------------|
+| `local` | Production. GPU server, `.gguf` models. Zero external calls.   |
+| `cloud` | BAILII/LegalBench eval and development. OpenAI-compatible API. |
 
 ---
 
@@ -95,7 +82,7 @@ All via environment variables (`.env`):
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ARKE_SPACE` | `default` | Dataspace name (isolates documents per client) |
+| `ARKE_WORKSPACE` | `default` | Workspace name (isolates documents per client) |
 | `CHUNK_SIZE` | `600` | Characters per chunk |
 | `OVERLAP` | `0.0` | Overlap fraction (0–0.5) |
 | `ALPHA` | `0.7` | Blend: 1.0 = pure semantic, 0.0 = pure keyword |
@@ -119,14 +106,23 @@ Arke is open source under MIT. Clone it, run it, own it.
 # ═══════════════════════════════════════════
 
 """CLI client. Usage: arke ask "your question" """
+import os
 import sys
+from pathlib import Path
 
 from arke.server import mailbox
 
 
+def _workspace_path() -> Path:
+    arke_root = Path(os.environ.get("ARKE_ROOT") or Path.home() / ".arke")
+    workspace = os.environ.get("ARKE_WORKSPACE", "default")
+    return arke_root / "workspaces" / workspace
+
+
 def ask(query: str) -> None:
-    msg_id = mailbox.send({"cmd": "ask", "query": query})
-    response = mailbox.receive(msg_id)
+    ws = _workspace_path()
+    msg_id = mailbox.send({"cmd": "ask", "query": query}, ws)
+    response = mailbox.receive(msg_id, ws)
 
     if response is None:
         print("error: arke did not respond", file=sys.stderr)
@@ -139,7 +135,9 @@ def ask(query: str) -> None:
     print(response["answer"])
 
     for cite in response.get("citations", []):
-        print(f"  [{cite['source']}] {cite['text'][:80]}...")
+        source = cite.get("filename") or cite.get("source", "?")
+        text = cite.get("text", "")
+        print(f"  [{source}] {text[:80]}...")
 
 
 def main() -> None:
@@ -188,23 +186,16 @@ SMTP_PORT = 587
 SMTP_USER = "apikey"
 WEBHOOK_PORT = 8080
 
-EMAIL_STYLE = "font-family:Georgia,serif;font-size:11pt;line-height:1.55;color:#222"
-H3_STYLE = "margin:18px 0 8px 0"
-PARA_STYLE = "margin:10px 0"
-LIST_STYLE = "margin:8px 0;padding-left:24px"
-LI_STYLE = "margin-bottom:6px"
-BLOCKQUOTE_STYLE = "margin:8px 0;padding:4px 12px;border-left:3px solid #bbb;color:#555"
-HR_STYLE = "margin:24px 0;border:none;border-top:1px solid #ddd"
-SOURCES_HEADER_STYLE = "margin:0 0 12px 0"
-SOURCE_LABEL_STYLE = "margin:14px 0 4px 0"
-CITATION_QUOTE_STYLE = "margin:0 0 0 8px;padding:4px 12px;border-left:3px solid #ccc;color:#555"
+EMAIL_STYLE = "font-family:Georgia,serif;font-size:12pt;line-height:1.3;text-align:justify"
+H3_STYLE = "margin:18px 0 8px 0;text-align:left"
+PARA_STYLE = "margin:6px 0"
+LIST_STYLE = "margin:6px 0;padding-left:24px"
+LI_STYLE = "margin-bottom:4px"
+BLOCKQUOTE_STYLE = "margin:6px 0;padding:4px 12px;border-left:3px solid #bbb"
+SOURCE_LINE_STYLE = "margin:2px 0 14px 0;font-size:10pt;color:#888;font-style:italic;text-align:left"
 FOOTER_STYLE = "margin:28px 0 0 0;padding-top:12px;border-top:1px solid #eee;font-size:9.5pt;color:#888"
 
-FOOTER_HTML = (
-    "This is a public demo of Arke on UK case law (BAILII). "
-    "Arke is private legal intelligence — it runs on your firm's server. "
-    "Your documents never leave your network."
-)
+FOOTER_HTML = "This is a public demo of Arke on UK case law (BAILII)."
 
 
 @dataclass(frozen=True)
@@ -252,12 +243,14 @@ def _parse_multipart(content_type: str, body: bytes) -> dict[str, bytes]:
     return fields
 
 
-def _parse_rfc822(raw: bytes) -> tuple[str, str, str]:
-    """Extract (sender_addr, subject, plain_body) from raw RFC 822."""
+def _parse_rfc822(raw: bytes) -> tuple[str, str, str, str, str]:
+    """Extract (sender, subject, body, message_id, references) from raw RFC 822."""
     msg = BytesParser(policy=email.policy.default).parsebytes(raw)
     sender_raw = msg.get("From", "")
     sender_addr = email.utils.parseaddr(sender_raw)[1]
     subject = msg.get("Subject", "(no subject)")
+    message_id = msg.get("Message-ID", "").strip()
+    references = msg.get("References", "").strip()
 
     body = ""
     if msg.is_multipart():
@@ -274,7 +267,7 @@ def _parse_rfc822(raw: bytes) -> tuple[str, str, str]:
     else:
         body = msg.get_content()
 
-    return sender_addr, subject, body.strip()
+    return sender_addr, subject, body.strip(), message_id, references
 
 
 # --- rendering ----------------------------------------------------------------
@@ -286,6 +279,7 @@ def _escape(text: str) -> str:
 def _inline(text: str) -> str:
     out = _escape(text)
     out = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", out)
+    out = re.sub(r"\*([^*]+)\*", r"<em>\1</em>", out)
     return out
 
 
@@ -295,6 +289,7 @@ def _is_block_start(line: str) -> bool:
         or line.startswith("# ")
         or line.startswith("> ")
         or line.startswith("- ")
+        or line.startswith("— ")
         or re.match(r"^\d+\.\s", line) is not None
     )
 
@@ -344,6 +339,11 @@ def _md_to_html(md: str) -> str:
             parts.append(f'<blockquote style="{BLOCKQUOTE_STYLE}">{quote_html}</blockquote>')
             continue
 
+        if line.startswith("— "):
+            parts.append(f'<p style="{SOURCE_LINE_STYLE}">{_inline(line)}</p>')
+            i += 1
+            continue
+
         para_lines: list[str] = []
         while i < len(lines) and lines[i].rstrip() and not _is_block_start(lines[i].rstrip()):
             para_lines.append(_inline(lines[i].rstrip()))
@@ -355,29 +355,24 @@ def _md_to_html(md: str) -> str:
 
 def _build_html_reply(answer_md: str, citations: list[dict]) -> str:
     answer_html = _md_to_html(answer_md)
-    parts = [f'<div style="{EMAIL_STYLE}">', answer_html]
-
-    if citations:
-        parts.append(f'<hr style="{HR_STYLE}">')
-        parts.append(f'<h3 style="{SOURCES_HEADER_STYLE}">Sources</h3>')
-        for number, citation in enumerate(citations, 1):
-            label = _escape(citation.get("source", "unknown"))
-            raw_text = citation.get("text", "")
-            quote_html = _escape(raw_text).replace("\n", "<br>")
-            parts.append(
-                f'<p style="{SOURCE_LABEL_STYLE}"><strong>[{number}]</strong> '
-                f'<em>{label}</em></p>'
-                f'<blockquote style="{CITATION_QUOTE_STYLE}">{quote_html}</blockquote>'
-            )
-
-    parts.append(f'<p style="{FOOTER_STYLE}">{FOOTER_HTML}</p>')
-    parts.append("</div>")
-    return "".join(parts)
+    return "".join([
+        f'<div style="{EMAIL_STYLE}">',
+        answer_html,
+        f'<p style="{FOOTER_STYLE}">{FOOTER_HTML}</p>',
+        "</div>",
+    ])
 
 
 # --- SMTP ---------------------------------------------------------------------
 
-def _send_reply(cfg: EmailConfig, to: str, subject: str, html: str) -> str:
+def _send_reply(
+    cfg: EmailConfig,
+    to: str,
+    subject: str,
+    html: str,
+    in_reply_to: str = "",
+    references: str = "",
+) -> str:
     """Send reply via SendGrid SMTP. Returns the RFC-822 Message-ID for log correlation."""
     msg = EmailMessage()
     message_id = email.utils.make_msgid(domain="arke.legal")
@@ -387,6 +382,11 @@ def _send_reply(cfg: EmailConfig, to: str, subject: str, html: str) -> str:
     msg["To"] = to
     msg["Subject"] = subject
     msg["List-Unsubscribe"] = f"<mailto:{cfg.mailbox}?subject=unsubscribe>"
+    if in_reply_to:
+        msg["In-Reply-To"] = in_reply_to
+        # References chain: prior chain + original message-id
+        chain = f"{references} {in_reply_to}".strip() if references else in_reply_to
+        msg["References"] = chain
     msg.set_content("Please view this message in an HTML-capable email client.")
     msg.add_alternative(html, subtype="html")
 
@@ -409,12 +409,13 @@ def _process_inbound(cfg: EmailConfig, raw_mime: bytes) -> None:
     from arke.server import mailbox as arke_mailbox
 
     try:
-        sender, subject, body_text = _parse_rfc822(raw_mime)
+        sender, subject, body_text, orig_msg_id, orig_refs = _parse_rfc822(raw_mime)
     except Exception as e:
         logger.exception("rfc822 parse failed: %s", e)
         return
 
-    logger.info("inbound: from=%s subj=%r body=%d chars", sender, subject, len(body_text))
+    logger.info("inbound: from=%s subj=%r body=%d chars orig-msg-id=%s",
+                sender, subject, len(body_text), orig_msg_id or "(none)")
 
     if sender.lower() == cfg.mailbox.lower():
         logger.info("self-loop, dropped")
@@ -435,7 +436,10 @@ def _process_inbound(cfg: EmailConfig, raw_mime: bytes) -> None:
 
         html_body = _build_html_reply(answer_md, citations)
         reply_subject = subject if subject.lower().startswith("re:") else f"Re: {subject}"
-        message_id = _send_reply(cfg, to=sender, subject=reply_subject, html=html_body)
+        message_id = _send_reply(
+            cfg, to=sender, subject=reply_subject, html=html_body,
+            in_reply_to=orig_msg_id, references=orig_refs,
+        )
         logger.info("reply sent msg-id=%s to=%s subj=%r", message_id, sender, reply_subject)
     except Exception as e:
         logger.exception("processing failed for %s: %s", sender, e)
@@ -558,15 +562,20 @@ if __name__ == "__main__":
 # ═══════════════════════════════════════════
 
 """TUI client. Run: python -m arke.clients.tui"""
-# TODO: replace with Textual when we wire up the UI
-# For now: minimal readline loop so we can test mailbox end-to-end
-
-import sys
+import os
+from pathlib import Path
 
 from arke.server import mailbox
 
 
+def _workspace_path() -> Path:
+    arke_root = Path(os.environ.get("ARKE_ROOT") or Path.home() / ".arke")
+    workspace = os.environ.get("ARKE_WORKSPACE", "default")
+    return arke_root / "workspaces" / workspace
+
+
 def run() -> None:
+    ws = _workspace_path()
     print("Arke TUI — type your question, Ctrl-C to exit\n")
 
     while True:
@@ -579,8 +588,8 @@ def run() -> None:
         if not query:
             continue
 
-        msg_id = mailbox.send({"cmd": "ask", "query": query})
-        response = mailbox.receive(msg_id)
+        msg_id = mailbox.send({"cmd": "ask", "query": query}, ws)
+        response = mailbox.receive(msg_id, ws)
 
         if response is None:
             print("error: arke did not respond\n")
@@ -593,7 +602,9 @@ def run() -> None:
         print(f"\n{response['answer']}\n")
 
         for cite in response.get("citations", []):
-            print(f"  [{cite['source']}] {cite['text'][:80]}...")
+            source = cite.get("filename") or cite.get("source", "?")
+            text = cite.get("text", "")
+            print(f"  [{source}] {text[:80]}...")
         print()
 
 
@@ -1378,7 +1389,8 @@ class Config:
     cloud_api_key: str = ""
     cloud_base_url: str = "https://api.openai.com"
     cloud_embed_model: str = "text-embedding-3-small"
-    cloud_inference_model: str = "gpt-4o"
+    cloud_fast_model: str = "gpt-4o-mini"   # fast/cheap — per-doc filter, trimmer, ingest case-names
+    cloud_strong_model: str = "gpt-4o"      # judgment — mosaic clustering
 
     # RAG parameters
     embedding_dim: int = 0
@@ -1422,7 +1434,8 @@ class Config:
             cloud_api_key=os.environ.get("CLOUD_API_KEY", ""),
             cloud_base_url=os.environ.get("CLOUD_BASE_URL", "https://api.openai.com"),
             cloud_embed_model=os.environ.get("CLOUD_EMBED_MODEL", "text-embedding-3-small"),
-            cloud_inference_model=os.environ.get("CLOUD_INFERENCE_MODEL", "gpt-4o"),
+            cloud_fast_model=os.environ.get("CLOUD_FAST_MODEL", "gpt-4o-mini"),
+            cloud_strong_model=os.environ.get("CLOUD_STRONG_MODEL", "gpt-4o"),
             embedding_dim=int(os.environ.get("EMBEDDING_DIM", "0")),
             chunk_size=int(os.environ.get("CHUNK_SIZE", "600")),
             overlap=float(os.environ.get("OVERLAP", "0.0")),
@@ -1641,7 +1654,7 @@ import json
 import logging
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
@@ -1649,9 +1662,43 @@ import numpy as np
 from . import chunker, loader, mailbox, sdb
 from .bm25 import BM25Index
 from .config import Config
-from .models import Models
+from .models import LLM, Models
 from .workspace import mount as mount_workspace
 from .types import Chunk, Doc, SearchHit
+
+CASE_NAME_TABLE = "case_names"
+CASE_NAME_EXTRACT_CHARS = 2000
+CASE_NAME_WORKERS = 10
+CASE_NAME_PROMPT = (
+    "Return a one-line label for this document.\n"
+    "\n"
+    "FIRST decide: is this a court judgment with named parties?\n"
+    "\n"
+    "IF YES → return ONLY the case title. Nothing else.\n"
+    "Format: 'Party A v Party B [Year]' — year in square brackets ONLY if "
+    "clearly stated in the document. If year is absent, omit the brackets "
+    "entirely — never write the literal '[Year]'.\n"
+    "Do NOT prefix with 'Case judgment,', 'Judgment on,', 'Court decision,' "
+    "or any descriptor. The case title stands alone.\n"
+    "  Caparo Industries v Dickman [1990]\n"
+    "  R (Miller) v Prime Minister [2019]\n"
+    "  Baird Textile Holdings Ltd v Marks and Spencer plc\n"
+    "\n"
+    "IF NO (contract, memo, letter, witness statement, expert report, opinion, "
+    "email, pleading, research note, etc.) → return a brief descriptor: "
+    "document type + subject + date if available.\n"
+    "  Engagement letter, Smith Holdings audit, January 2022\n"
+    "  Witness statement of James Wilson, March 2024\n"
+    "  Expert report on construction defects, Dr Jane Smith, 2020\n"
+    "\n"
+    "Hard rules:\n"
+    "- One line, plain text, no quotes, no trailing punctuation.\n"
+    "- Never include the word 'unknown' inside the label — if a party or date "
+    "is unknown, omit that piece.\n"
+    "- Never include literal placeholders like '[Year]' or '[Date]'.\n"
+    "- If the document's nature is genuinely impossible to identify at all, "
+    "return exactly the single word: unknown"
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1732,8 +1779,6 @@ def _ingest(digest_path: Path, cfg: Config, models: Models, docs: dict[str, Doc]
 
         doc, text = result
 
-        sdb.put_bin("sources", doc.id, path.read_bytes())
-
         chunk_datas = chunker.chunk(text, cfg.chunk_size, cfg.overlap)
         chunks = [
             Chunk(doc_id=doc.id, chunk_index=i, clean=cd.clean, head=cd.head, tail=cd.tail)
@@ -1761,7 +1806,6 @@ def _ingest(digest_path: Path, cfg: Config, models: Models, docs: dict[str, Doc]
             bm25.add(f"{doc.id}:{chunk.chunk_index}", chunk.overlapped())
             doc.chunks.append(chunk)
 
-        doc.save()
         docs[doc.id] = doc
         cached_total += cached
         embedded_total += embedded
@@ -1775,7 +1819,57 @@ def _ingest(digest_path: Path, cfg: Config, models: Models, docs: dict[str, Doc]
         "ingest done — %d docs, %d chunks (%d cached, %d embedded)",
         len(docs), _chunk_count(docs), cached_total, embedded_total,
     )
+
+    _fill_case_names(docs, models.llm)
+
     return _dir_hash(digest_path)
+
+
+def _extract_case_name(doc: Doc, llm: LLM) -> str:
+    """Ask the fast LLM for 'Party A v Party B'. Returns "" on unknown/failure."""
+    if not doc.chunks:
+        return ""
+    sample = (doc.chunks[0].head + " " + doc.chunks[0].clean)[:CASE_NAME_EXTRACT_CHARS]
+    try:
+        raw = llm.chat(CASE_NAME_PROMPT, sample).strip()
+    except Exception as e:
+        logger.warning("case-name extract failed for %s: %s", doc.id[:8], e)
+        return ""
+    # Reject if LLM gave us free-form noise
+    if not raw or raw.lower() == "unknown" or len(raw) > 200 or "\n" in raw:
+        return ""
+    return raw
+
+
+def _fill_case_names(docs: dict[str, Doc], llm: LLM) -> None:
+    """Populate doc.metadata['case_name'] via cache lookup + parallel LLM for misses.
+    Cache is keyed by doc.id (content hash) → survives restarts, invalidates on
+    content change automatically.
+    """
+    pending: list[Doc] = []
+    hits = 0
+    for doc in docs.values():
+        cached = sdb.get_json(CASE_NAME_TABLE, doc.id)
+        if cached is not None:
+            doc.metadata["case_name"] = cached.get("name", "")
+            hits += 1
+        else:
+            pending.append(doc)
+
+    logger.info("case-names: %d cached, %d pending", hits, len(pending))
+    if not pending:
+        return
+
+    def worker(doc: Doc) -> tuple[Doc, str]:
+        return doc, _extract_case_name(doc, llm)
+
+    with ThreadPoolExecutor(max_workers=CASE_NAME_WORKERS) as ex:
+        for future in as_completed(ex.submit(worker, d) for d in pending):
+            doc, name = future.result()
+            doc.metadata["case_name"] = name
+            sdb.put_json(CASE_NAME_TABLE, doc.id, {"name": name})
+
+    logger.info("case-names: extracted %d via LLM", len(pending))
 
 
 # --- main loop ---------------------------------------------------------------
@@ -1862,8 +1956,7 @@ def _ask(request: dict, docs: dict[str, Doc], bm25: BM25Index, cfg: Config, mode
 
 
 def _source_label(doc: Doc) -> str:
-    filename = doc.metadata.get("filename") or doc.source or doc.id[:8]
-    return Path(filename).stem
+    return doc.metadata.get("filename") or doc.source or doc.id[:8]
 
 
 def _sample(request: dict, docs: dict[str, Doc]) -> dict:
@@ -1879,61 +1972,88 @@ def _sample(request: dict, docs: dict[str, Doc]) -> dict:
 
 # --- stress-test (adversarial authority) ------------------------------------
 
-COUNTER_QUERIES_PROMPT = (
-    "You receive a legal argument that a practising litigator wants to "
-    "stress-test. Generate 5 short search queries that would find authorities "
-    "in their own corpus that OPPOSE, LIMIT, or DISTINGUISH this position.\n"
-    "\n"
-    "Focus on: contrary precedents, doctrinal limits of the claimed principle, "
-    "cases with opposite ratio on similar facts, distinguishing authorities, "
-    "exceptions to the rule.\n"
-    "\n"
-    "Output: one query per line. No numbering. No explanations. 5 queries."
-)
-
 PER_DOC_PROMPT = (
     "You analyse one document from a litigator's case archive. Identify chunks "
-    "that form an adversarial mosaic against the lawyer's argument — parts of "
-    "the document that would weaken, limit, or contradict the argument.\n"
+    "that form an adversarial mosaic against the lawyer's argument — the parts "
+    "that would weaken, limit, or contradict it. Be generous: include any "
+    "chunk that even partially supports an adversarial reading. A separate "
+    "pass will refine the selection later.\n"
     "\n"
     "Return ONLY a JSON array of chunk indices, e.g. [3, 7, 14, 22].\n"
     "\n"
     "Rules:\n"
     "- Range 5-25 indices when the document has adversarial content.\n"
-    "- Return [] if the document contains nothing adversarial to the argument.\n"
+    "- Return [] if the document contains nothing adversarial.\n"
     "- Do not explain. Output only the JSON array."
 )
 
-STRESS_SYSTEM_PROMPT = (
-    "You are adverse counsel reviewing a lawyer's position. From their own "
-    "archive you receive passages that may weaken, limit, or contradict it. "
-    "Produce a citation mosaic showing what in the lawyer's own documents "
-    "cuts against their argument.\n"
+MOSAIC_SYSTEM_PROMPT = (
+    "You are counsel stress-testing a lawyer's position. From passages in "
+    "their archive, identify cases that bear on the argument. For each case, "
+    "classify whether the authority SUPPORTS the lawyer's position or CUTS "
+    "AGAINST it, and write the specific legal proposition the passages prove.\n"
     "\n"
-    "Format (STRICT — do not deviate):\n"
-    "- Start directly with one opening sentence naming the main vulnerabilities. "
-    "No salutation, no 'Dear', no date, no 'Yours sincerely', no signature, no placeholders.\n"
-    "- Then 2-3 sections, each drawn from a DIFFERENT source document. "
-    "If you only use one source, that is a failure.\n"
-    "- Each section starts with '## ' followed by the source name.\n"
-    "- Under each heading, quote the relevant passages as '> ' blockquotes.\n"
-    "- After each quote, one sentence in plain prose explaining why it cuts "
-    "against the argument.\n"
-    "- British legal register. No advice, no opinion, no hedging.\n"
-    "- Skip sources that do not cut against the argument.\n"
-    "- Use ONLY the passages provided. Never invent case names or holdings."
+    "Output STRICTLY a JSON array:\n"
+    '[{"stance": "SUPPORTS"|"ATTACKS", "label": "proposition phrase", "passages": [1, 4]}, ...]\n'
+    "\n"
+    "Each cluster is ONE document (one authority) making ONE point. All "
+    "passages in a cluster must come from the same source document.\n"
+    "\n"
+    "stance — your honest judgement of valence:\n"
+    "  SUPPORTS: the authority reinforces the lawyer's position\n"
+    "  ATTACKS: the authority weakens or contradicts the lawyer's position\n"
+    "Both are valuable — partners need contrast (gas + brake).\n"
+    "\n"
+    "label — tight legal proposition the passages establish. 3-8 words. "
+    "Specific to the argument. Doctrinal language, not a case name.\n"
+    "  SUPPORTS examples:\n"
+    "    'No duty to public purchasers of shares'\n"
+    "    'Disclaimer effective to exclude responsibility'\n"
+    "    'Proximity absent where no direct dealings'\n"
+    "  ATTACKS examples:\n"
+    "    'Duty found where reliance was specific and known'\n"
+    "    'Assumption of responsibility implied despite disclaimer'\n"
+    "    'Indeterminate class does not bar duty'\n"
+    "  Bad for either stance:\n"
+    "    'Caparo precedent'        (just names case)\n"
+    "    'Duty of care limits'     (too generic)\n"
+    "\n"
+    "Rules:\n"
+    "- passages: 1-indexed passage numbers. 1-3 per cluster.\n"
+    "- 3-5 clusters total, each from a DIFFERENT source document.\n"
+    "- Mix SUPPORTS and ATTACKS naturally based on what the corpus contains — "
+    "don't force one side.\n"
+    "- Skip passages off-topic to the argument.\n"
+    "- If corpus contains nothing on-topic, output [].\n"
+    "- Output ONLY the JSON array."
+)
+
+TRIMMER_SYSTEM_PROMPT = (
+    "You receive a mosaic of case-law excerpts chosen as adversarial authority. "
+    "Your job is to trim procedural narrative, lead-in, and background from "
+    "within each quoted passage, leaving only the operative legal substance — "
+    "the ratio, the holding, the doctrinal statement.\n"
+    "\n"
+    "Rules:\n"
+    "- Within each blockquote, DELETE procedural text (recitations of claim "
+    "paragraphs, statement-of-claim references, background facts, procedural "
+    "history) and REPLACE the deleted span with '[…]' (bracket-ellipsis).\n"
+    "- NEVER remove a blockquote entirely.\n"
+    "- NEVER rewrite, paraphrase, or add new words. The ONLY new text you "
+    "may introduce is '[…]'. Every remaining word must appear verbatim in "
+    "the input.\n"
+    "- Preserve the structure exactly: ## headers (including [SUPPORTS]/[ATTACKS] "
+    "tags and middle-dot separators), > blockquotes, — source lines.\n"
+    "- If a passage is already lean (mostly ratio / holding), leave it as-is.\n"
+    "\n"
+    "Output the trimmed markdown. No preamble, no explanation."
 )
 
 STRESS_MAX_DOCS = 10
 STRESS_DOC_MAX_TOKENS = 50000
-STRESS_RETRIEVAL_K = 20
+STRESS_RETRIEVAL_K = 40
 STRESS_MAX_WORKERS = 3
-
-
-def _counter_queries(argument: str, llm) -> list[str]:
-    raw = llm.chat(COUNTER_QUERIES_PROMPT, argument)
-    queries = [q.strip(" -•*.\t").strip() for q in raw.splitlines()]
-    return [q for q in queries if q][:5]
+STRESS_MAX_PASSAGES_PER_DOC = 6
 
 
 def _per_doc_filter(argument: str, doc: Doc, llm) -> list[int]:
@@ -1954,6 +2074,61 @@ def _doc_token_estimate(doc: Doc) -> int:
     return sum(len(c.clean) for c in doc.chunks) // 4
 
 
+MAX_CHUNKS_PER_PASSAGE = 2
+
+
+def _merge_adjacent(chunks: list[Chunk]) -> list[str]:
+    """Group chunks by contiguous chunk_index, split long runs into sub-runs
+    of at most MAX_CHUNKS_PER_PASSAGE. Returns one passage text per sub-run.
+    """
+    if not chunks:
+        return []
+    ordered = sorted(chunks, key=lambda c: c.chunk_index)
+    runs: list[list[Chunk]] = [[ordered[0]]]
+    for c in ordered[1:]:
+        if c.chunk_index == runs[-1][-1].chunk_index + 1:
+            runs[-1].append(c)
+        else:
+            runs.append([c])
+    sub_runs: list[list[Chunk]] = []
+    for run in runs:
+        for i in range(0, len(run), MAX_CHUNKS_PER_PASSAGE):
+            sub_runs.append(run[i : i + MAX_CHUNKS_PER_PASSAGE])
+    passages: list[str] = []
+    for run in sub_runs:
+        body = " ".join(c.clean for c in run)
+        text = f"{run[0].head} {body} {run[-1].tail}"
+        passages.append(" ".join(text.split()))
+    return passages
+
+
+def _parse_clusters(raw: str, passage_count: int) -> list[dict]:
+    """Parse LLM JSON output into validated clusters: [{stance, label, passages}]."""
+    match = re.search(r"\[.*\]", raw, re.DOTALL)
+    if not match:
+        return []
+    try:
+        data = json.loads(match.group(0))
+    except (json.JSONDecodeError, ValueError):
+        return []
+    clusters: list[dict] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        label = item.get("label")
+        passages = item.get("passages")
+        stance = str(item.get("stance", "ATTACKS")).upper().strip()
+        if stance not in ("SUPPORTS", "ATTACKS"):
+            stance = "ATTACKS"
+        if not isinstance(label, str) or not isinstance(passages, list):
+            continue
+        valid = [p for p in passages if isinstance(p, int) and 1 <= p <= passage_count]
+        label_clean = label.strip().rstrip(".").strip()
+        if label_clean and valid:
+            clusters.append({"stance": stance, "label": label_clean, "passages": valid})
+    return clusters
+
+
 def _stress_test(
     request: dict, docs: dict[str, Doc], bm25: BM25Index, cfg: Config, models: Models
 ) -> dict:
@@ -1963,28 +2138,19 @@ def _stress_test(
 
     logger.info("stress-test: argument (%d chars)", len(argument))
 
-    counter_qs = _counter_queries(argument, models.llm)
-    logger.info("stress-test: %d counter-queries generated", len(counter_qs))
+    # Direct hybrid search on the argument — no counter-queries (drift-prone).
+    # Per-doc LLM filter below does the adversarial selection.
+    q_vec = np.array(models.embedder.embed([argument])[0], dtype=np.float32)
+    hits = _hybrid_search(docs, bm25, q_vec, argument, STRESS_RETRIEVAL_K, cfg.alpha)
 
-    # Broad retrieval — direct + counter-queries, dedupe by chunk key
-    all_queries = [argument] + counter_qs
-    seen_chunks: dict[str, SearchHit] = {}
-    for q in all_queries:
-        q_vec = np.array(models.embedder.embed([q])[0], dtype=np.float32)
-        hits = _hybrid_search(docs, bm25, q_vec, q, STRESS_RETRIEVAL_K, cfg.alpha)
-        for h in hits:
-            key = f"{h.chunk.doc_id}:{h.chunk.chunk_index}"
-            if key not in seen_chunks or h.similarity > seen_chunks[key].similarity:
-                seen_chunks[key] = h
-
-    # Rank docs by best chunk score across all queries
+    # Aggregate to doc-level by best chunk score
     by_doc: dict[str, float] = {}
-    for h in seen_chunks.values():
+    for h in hits:
         did = h.chunk.doc_id
         if did not in by_doc or h.similarity > by_doc[did]:
             by_doc[did] = h.similarity
     top_doc_ids = sorted(by_doc, key=lambda d: by_doc[d], reverse=True)[:STRESS_MAX_DOCS]
-    logger.info("stress-test: %d candidate docs", len(top_doc_ids))
+    logger.info("stress-test: %d candidate docs from %d chunks", len(top_doc_ids), len(hits))
 
     # Size filter first, then fan out per-doc LLM in parallel
     fit_docs: list[Doc] = []
@@ -2012,32 +2178,102 @@ def _stress_test(
             "citations": [],
         }
 
-    # Final LLM — writes the mosaic letter from selected chunks
-    citations: list[dict] = []
-    context_parts: list[str] = []
-    idx = 1
+    # Merge adjacent selected chunks per doc, cap per-doc, interleave across docs
+    from itertools import zip_longest
+
+    per_doc: list[list[dict]] = []
     for doc_id, chunks in mosaics.items():
         doc = docs[doc_id]
-        label = _source_label(doc)
-        filename = doc.metadata.get("filename") or label
-        for c in chunks:
-            context_parts.append(f"[{idx}] (source: {label}) {c.clean}")
-            citations.append({
+        filename = _source_label(doc)
+        case_name = doc.metadata.get("case_name", "") or ""
+        doc_passages = [
+            {
                 "doc_id": doc.id,
-                "source": label,
                 "filename": filename,
-                "text": c.clean,
-                "score": 1.0,
-            })
-            idx += 1
+                "case_name": case_name,
+                "text": text,
+            }
+            for text in _merge_adjacent(chunks)[:STRESS_MAX_PASSAGES_PER_DOC]
+        ]
+        if doc_passages:
+            per_doc.append(doc_passages)
 
-    context = "\n\n".join(context_parts)
-    user_msg = f"Lawyer's position:\n{argument}\n\nPassages from archive:\n{context}"
-    answer = models.llm.chat(STRESS_SYSTEM_PROMPT, user_msg)
-    logger.info("stress-test: complete — %d docs in mosaic, %d citations, answer=%dchars", len(mosaics), len(citations), len(answer))
-    logger.info("stress-test: answer preview:\n%s", answer[:2000])
+    # Round-robin so the first slots in the LLM context span all docs
+    passages: list[dict] = [
+        p for group in zip_longest(*per_doc) for p in group if p is not None
+    ]
 
-    return {"ok": True, "answer": answer, "citations": citations}
+    def _p_label(p: dict) -> str:
+        return f"{p['case_name']} ({p['filename']})" if p["case_name"] else p["filename"]
+    context = "\n\n".join(
+        f"[{i+1}] (source: {_p_label(p)}) {p['text']}" for i, p in enumerate(passages)
+    )
+    user_msg = f"Argument:\n{argument}\n\nPassages:\n{context}"
+    raw = models.strong_llm.chat(MOSAIC_SYSTEM_PROMPT, user_msg)
+    all_clusters = _parse_clusters(raw, len(passages))
+    # Enforce single-source per cluster and unique-source across clusters
+    seen_docs: set[str] = set()
+    clusters: list[dict] = []
+    for c in all_clusters:
+        cluster_docs = {passages[p - 1]["doc_id"] for p in c["passages"]}
+        if len(cluster_docs) != 1:
+            continue
+        doc_id = next(iter(cluster_docs))
+        if doc_id in seen_docs:
+            continue
+        seen_docs.add(doc_id)
+        clusters.append(c)
+    logger.info(
+        "stress-test: LLM returned %d clusters → %d after single-source / unique-doc filter",
+        len(all_clusters), len(clusters),
+    )
+
+    if not clusters:
+        return {
+            "ok": True,
+            "answer": "No adversarial authorities found in the provided archive.",
+            "citations": [],
+        }
+
+    # Render: '## [FOR|AGAINST] <case_name> · <label>' per cluster
+    parts: list[str] = []
+    used: list[dict] = []
+    for cluster in clusters:
+        first = passages[cluster["passages"][0] - 1]
+        case_name = first["case_name"]
+        stance = cluster["stance"]
+        label = cluster["label"]
+        if case_name:
+            header = f"[{stance}] {case_name} · {label}"
+        else:
+            header = f"[{stance}] {label}"
+        parts.append(f"## {header}")
+        for p_num in cluster["passages"]:
+            passage = passages[p_num - 1]
+            parts.append(f"> {passage['text']}")
+            used.append(passage)
+        parts.append(f"— {first['filename']}")
+
+    raw_answer = "\n\n".join(parts)
+    logger.info(
+        "stress-test: mosaic — %d clusters, %d/%d passages, raw=%dchars",
+        len(clusters), len(used), len(passages), len(raw_answer),
+    )
+    for i, cluster in enumerate(clusters, 1):
+        first = passages[cluster["passages"][0] - 1]
+        logger.info("  cluster %d: [%s] %r case=%r file=%s n_passages=%d",
+                    i, cluster["stance"], cluster["label"],
+                    first["case_name"] or "(none)",
+                    first["filename"], len(cluster["passages"]))
+
+    # Stage 3: trim procedural water from passages, preserve structure
+    answer = models.llm.chat(TRIMMER_SYSTEM_PROMPT, raw_answer)
+    answer = answer.strip()
+    reduction = (1 - len(answer) / max(len(raw_answer), 1)) * 100
+    logger.info("stress-test: trimmed → %dchars (%.0f%% reduction)", len(answer), reduction)
+    logger.info("stress-test: final answer:\n%s", answer)
+
+    return {"ok": True, "answer": answer, "citations": used}
 
 
 def _hybrid_search(
@@ -2132,17 +2368,20 @@ class LLM(Protocol):
 class Models:
     embedder: Embedder
     llm: LLM
+    strong_llm: LLM  # used for judgment-heavy work (mosaic clustering)
 
     @staticmethod
     def load(cfg: Config) -> "Models":
         if cfg.backend == "cloud":
-            from .backend_cloud import load
-            embedder, llm = load(cfg.cloud_base_url, cfg.cloud_api_key, cfg.cloud_embed_model, cfg.cloud_inference_model)
+            from .backend_cloud import CloudLLM, load
+            embedder, llm = load(cfg.cloud_base_url, cfg.cloud_api_key, cfg.cloud_embed_model, cfg.cloud_fast_model)
+            strong_llm = CloudLLM(cfg.cloud_base_url, cfg.cloud_api_key, cfg.cloud_strong_model)
         else:
             from .backend_local import load
             embedder, llm = load(cfg.embed_model_path, cfg.inference_model_path)
+            strong_llm = llm  # local backend uses the same LLM for both
 
-        return Models(embedder=embedder, llm=llm)
+        return Models(embedder=embedder, llm=llm, strong_llm=strong_llm)
 
 # ═══════════════════════════════════════════
 # arke/server/sdb.py
@@ -2280,7 +2519,7 @@ def wipe(table: str) -> None:
 
 import hashlib
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Iterator
+from typing import Any
 
 import numpy as np
 
@@ -2320,53 +2559,13 @@ class Chunk:
 
 @dataclass
 class Doc:
-    TABLE: ClassVar[str] = "documents"
-
     id: str
     source: str
     created: int
     modified: int
     metadata: dict[str, Any] = field(default_factory=dict)
     tags: list[str] = field(default_factory=list)
-
-    # Runtime only — re-grown on every unwrap, never serialized.
     chunks: list[Chunk] = field(default_factory=list, compare=False, repr=False)
-    _dirty: bool = field(default=False, compare=False, repr=False)
-
-    def wrap(self) -> dict:
-        return {
-            "id": self.id,
-            "source": self.source,
-            "created": self.created,
-            "modified": self.modified,
-            "metadata": self.metadata,
-            "tags": self.tags,
-        }
-
-    @classmethod
-    def unwrap(cls, d: dict) -> "Doc":
-        return cls(
-            id=d["id"],
-            source=d["source"],
-            created=d["created"],
-            modified=d["modified"],
-            metadata=d.get("metadata", {}),
-            tags=d.get("tags", []),
-        )
-
-    def save(self) -> None:
-        sdb.put_json(self.TABLE, self.id, self.wrap())
-        self._dirty = False
-
-    @classmethod
-    def load(cls, id: str) -> "Doc | None":
-        data = sdb.get_json(cls.TABLE, id)
-        return cls.unwrap(data) if data else None
-
-    @classmethod
-    def scan(cls) -> Iterator["Doc"]:
-        for _, data in sdb.scan_json(cls.TABLE):
-            yield cls.unwrap(data)
 
 
 @dataclass(frozen=True)

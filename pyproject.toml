@@ -1,6 +1,6 @@
 [project]
 name = "arke-legal"
-version = "0.1.351"
+version = "0.1.355"
 description = "Local-first RAG for legal teams."
 requires-python = ">=3.12"
 license = "MIT"

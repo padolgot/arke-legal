@@ -15,7 +15,7 @@ import json
 import logging
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
@@ -23,9 +23,43 @@ import numpy as np
 from . import chunker, loader, mailbox, sdb
 from .bm25 import BM25Index
 from .config import Config
-from .models import Models
+from .models import LLM, Models
 from .workspace import mount as mount_workspace
 from .types import Chunk, Doc, SearchHit
+
+CASE_NAME_TABLE = "case_names"
+CASE_NAME_EXTRACT_CHARS = 2000
+CASE_NAME_WORKERS = 10
+CASE_NAME_PROMPT = (
+    "Return a one-line label for this document.\n"
+    "\n"
+    "FIRST decide: is this a court judgment with named parties?\n"
+    "\n"
+    "IF YES → return ONLY the case title. Nothing else.\n"
+    "Format: 'Party A v Party B [Year]' — year in square brackets ONLY if "
+    "clearly stated in the document. If year is absent, omit the brackets "
+    "entirely — never write the literal '[Year]'.\n"
+    "Do NOT prefix with 'Case judgment,', 'Judgment on,', 'Court decision,' "
+    "or any descriptor. The case title stands alone.\n"
+    "  Caparo Industries v Dickman [1990]\n"
+    "  R (Miller) v Prime Minister [2019]\n"
+    "  Baird Textile Holdings Ltd v Marks and Spencer plc\n"
+    "\n"
+    "IF NO (contract, memo, letter, witness statement, expert report, opinion, "
+    "email, pleading, research note, etc.) → return a brief descriptor: "
+    "document type + subject + date if available.\n"
+    "  Engagement letter, Smith Holdings audit, January 2022\n"
+    "  Witness statement of James Wilson, March 2024\n"
+    "  Expert report on construction defects, Dr Jane Smith, 2020\n"
+    "\n"
+    "Hard rules:\n"
+    "- One line, plain text, no quotes, no trailing punctuation.\n"
+    "- Never include the word 'unknown' inside the label — if a party or date "
+    "is unknown, omit that piece.\n"
+    "- Never include literal placeholders like '[Year]' or '[Date]'.\n"
+    "- If the document's nature is genuinely impossible to identify at all, "
+    "return exactly the single word: unknown"
+)
 
 logger = logging.getLogger(__name__)
 
@@ -106,8 +140,6 @@ def _ingest(digest_path: Path, cfg: Config, models: Models, docs: dict[str, Doc]
 
         doc, text = result
 
-        sdb.put_bin("sources", doc.id, path.read_bytes())
-
         chunk_datas = chunker.chunk(text, cfg.chunk_size, cfg.overlap)
         chunks = [
             Chunk(doc_id=doc.id, chunk_index=i, clean=cd.clean, head=cd.head, tail=cd.tail)
@@ -135,7 +167,6 @@ def _ingest(digest_path: Path, cfg: Config, models: Models, docs: dict[str, Doc]
             bm25.add(f"{doc.id}:{chunk.chunk_index}", chunk.overlapped())
             doc.chunks.append(chunk)
 
-        doc.save()
         docs[doc.id] = doc
         cached_total += cached
         embedded_total += embedded
@@ -149,7 +180,57 @@ def _ingest(digest_path: Path, cfg: Config, models: Models, docs: dict[str, Doc]
         "ingest done — %d docs, %d chunks (%d cached, %d embedded)",
         len(docs), _chunk_count(docs), cached_total, embedded_total,
     )
+
+    _fill_case_names(docs, models.llm)
+
     return _dir_hash(digest_path)
+
+
+def _extract_case_name(doc: Doc, llm: LLM) -> str:
+    """Ask the fast LLM for 'Party A v Party B'. Returns "" on unknown/failure."""
+    if not doc.chunks:
+        return ""
+    sample = (doc.chunks[0].head + " " + doc.chunks[0].clean)[:CASE_NAME_EXTRACT_CHARS]
+    try:
+        raw = llm.chat(CASE_NAME_PROMPT, sample).strip()
+    except Exception as e:
+        logger.warning("case-name extract failed for %s: %s", doc.id[:8], e)
+        return ""
+    # Reject if LLM gave us free-form noise
+    if not raw or raw.lower() == "unknown" or len(raw) > 200 or "\n" in raw:
+        return ""
+    return raw
+
+
+def _fill_case_names(docs: dict[str, Doc], llm: LLM) -> None:
+    """Populate doc.metadata['case_name'] via cache lookup + parallel LLM for misses.
+    Cache is keyed by doc.id (content hash) → survives restarts, invalidates on
+    content change automatically.
+    """
+    pending: list[Doc] = []
+    hits = 0
+    for doc in docs.values():
+        cached = sdb.get_json(CASE_NAME_TABLE, doc.id)
+        if cached is not None:
+            doc.metadata["case_name"] = cached.get("name", "")
+            hits += 1
+        else:
+            pending.append(doc)
+
+    logger.info("case-names: %d cached, %d pending", hits, len(pending))
+    if not pending:
+        return
+
+    def worker(doc: Doc) -> tuple[Doc, str]:
+        return doc, _extract_case_name(doc, llm)
+
+    with ThreadPoolExecutor(max_workers=CASE_NAME_WORKERS) as ex:
+        for future in as_completed(ex.submit(worker, d) for d in pending):
+            doc, name = future.result()
+            doc.metadata["case_name"] = name
+            sdb.put_json(CASE_NAME_TABLE, doc.id, {"name": name})
+
+    logger.info("case-names: extracted %d via LLM", len(pending))
 
 
 # --- main loop ---------------------------------------------------------------
@@ -236,8 +317,7 @@ def _ask(request: dict, docs: dict[str, Doc], bm25: BM25Index, cfg: Config, mode
 
 
 def _source_label(doc: Doc) -> str:
-    filename = doc.metadata.get("filename") or doc.source or doc.id[:8]
-    return Path(filename).stem
+    return doc.metadata.get("filename") or doc.source or doc.id[:8]
 
 
 def _sample(request: dict, docs: dict[str, Doc]) -> dict:
@@ -253,61 +333,88 @@ def _sample(request: dict, docs: dict[str, Doc]) -> dict:
 
 # --- stress-test (adversarial authority) ------------------------------------
 
-COUNTER_QUERIES_PROMPT = (
-    "You receive a legal argument that a practising litigator wants to "
-    "stress-test. Generate 5 short search queries that would find authorities "
-    "in their own corpus that OPPOSE, LIMIT, or DISTINGUISH this position.\n"
-    "\n"
-    "Focus on: contrary precedents, doctrinal limits of the claimed principle, "
-    "cases with opposite ratio on similar facts, distinguishing authorities, "
-    "exceptions to the rule.\n"
-    "\n"
-    "Output: one query per line. No numbering. No explanations. 5 queries."
-)
-
 PER_DOC_PROMPT = (
     "You analyse one document from a litigator's case archive. Identify chunks "
-    "that form an adversarial mosaic against the lawyer's argument — parts of "
-    "the document that would weaken, limit, or contradict the argument.\n"
+    "that form an adversarial mosaic against the lawyer's argument — the parts "
+    "that would weaken, limit, or contradict it. Be generous: include any "
+    "chunk that even partially supports an adversarial reading. A separate "
+    "pass will refine the selection later.\n"
     "\n"
     "Return ONLY a JSON array of chunk indices, e.g. [3, 7, 14, 22].\n"
     "\n"
     "Rules:\n"
     "- Range 5-25 indices when the document has adversarial content.\n"
-    "- Return [] if the document contains nothing adversarial to the argument.\n"
+    "- Return [] if the document contains nothing adversarial.\n"
     "- Do not explain. Output only the JSON array."
 )
 
-STRESS_SYSTEM_PROMPT = (
-    "You are adverse counsel reviewing a lawyer's position. From their own "
-    "archive you receive passages that may weaken, limit, or contradict it. "
-    "Produce a citation mosaic showing what in the lawyer's own documents "
-    "cuts against their argument.\n"
+MOSAIC_SYSTEM_PROMPT = (
+    "You are counsel stress-testing a lawyer's position. From passages in "
+    "their archive, identify cases that bear on the argument. For each case, "
+    "classify whether the authority SUPPORTS the lawyer's position or CUTS "
+    "AGAINST it, and write the specific legal proposition the passages prove.\n"
     "\n"
-    "Format (STRICT — do not deviate):\n"
-    "- Start directly with one opening sentence naming the main vulnerabilities. "
-    "No salutation, no 'Dear', no date, no 'Yours sincerely', no signature, no placeholders.\n"
-    "- Then 2-3 sections, each drawn from a DIFFERENT source document. "
-    "If you only use one source, that is a failure.\n"
-    "- Each section starts with '## ' followed by the source name.\n"
-    "- Under each heading, quote the relevant passages as '> ' blockquotes.\n"
-    "- After each quote, one sentence in plain prose explaining why it cuts "
-    "against the argument.\n"
-    "- British legal register. No advice, no opinion, no hedging.\n"
-    "- Skip sources that do not cut against the argument.\n"
-    "- Use ONLY the passages provided. Never invent case names or holdings."
+    "Output STRICTLY a JSON array:\n"
+    '[{"stance": "SUPPORTS"|"ATTACKS", "label": "proposition phrase", "passages": [1, 4]}, ...]\n'
+    "\n"
+    "Each cluster is ONE document (one authority) making ONE point. All "
+    "passages in a cluster must come from the same source document.\n"
+    "\n"
+    "stance — your honest judgement of valence:\n"
+    "  SUPPORTS: the authority reinforces the lawyer's position\n"
+    "  ATTACKS: the authority weakens or contradicts the lawyer's position\n"
+    "Both are valuable — partners need contrast (gas + brake).\n"
+    "\n"
+    "label — tight legal proposition the passages establish. 3-8 words. "
+    "Specific to the argument. Doctrinal language, not a case name.\n"
+    "  SUPPORTS examples:\n"
+    "    'No duty to public purchasers of shares'\n"
+    "    'Disclaimer effective to exclude responsibility'\n"
+    "    'Proximity absent where no direct dealings'\n"
+    "  ATTACKS examples:\n"
+    "    'Duty found where reliance was specific and known'\n"
+    "    'Assumption of responsibility implied despite disclaimer'\n"
+    "    'Indeterminate class does not bar duty'\n"
+    "  Bad for either stance:\n"
+    "    'Caparo precedent'        (just names case)\n"
+    "    'Duty of care limits'     (too generic)\n"
+    "\n"
+    "Rules:\n"
+    "- passages: 1-indexed passage numbers. 1-3 per cluster.\n"
+    "- 3-5 clusters total, each from a DIFFERENT source document.\n"
+    "- Mix SUPPORTS and ATTACKS naturally based on what the corpus contains — "
+    "don't force one side.\n"
+    "- Skip passages off-topic to the argument.\n"
+    "- If corpus contains nothing on-topic, output [].\n"
+    "- Output ONLY the JSON array."
+)
+
+TRIMMER_SYSTEM_PROMPT = (
+    "You receive a mosaic of case-law excerpts chosen as adversarial authority. "
+    "Your job is to trim procedural narrative, lead-in, and background from "
+    "within each quoted passage, leaving only the operative legal substance — "
+    "the ratio, the holding, the doctrinal statement.\n"
+    "\n"
+    "Rules:\n"
+    "- Within each blockquote, DELETE procedural text (recitations of claim "
+    "paragraphs, statement-of-claim references, background facts, procedural "
+    "history) and REPLACE the deleted span with '[…]' (bracket-ellipsis).\n"
+    "- NEVER remove a blockquote entirely.\n"
+    "- NEVER rewrite, paraphrase, or add new words. The ONLY new text you "
+    "may introduce is '[…]'. Every remaining word must appear verbatim in "
+    "the input.\n"
+    "- Preserve the structure exactly: ## headers (including [SUPPORTS]/[ATTACKS] "
+    "tags and middle-dot separators), > blockquotes, — source lines.\n"
+    "- If a passage is already lean (mostly ratio / holding), leave it as-is.\n"
+    "\n"
+    "Output the trimmed markdown. No preamble, no explanation."
 )
 
 STRESS_MAX_DOCS = 10
 STRESS_DOC_MAX_TOKENS = 50000
-STRESS_RETRIEVAL_K = 20
+STRESS_RETRIEVAL_K = 40
 STRESS_MAX_WORKERS = 3
-
-
-def _counter_queries(argument: str, llm) -> list[str]:
-    raw = llm.chat(COUNTER_QUERIES_PROMPT, argument)
-    queries = [q.strip(" -•*.\t").strip() for q in raw.splitlines()]
-    return [q for q in queries if q][:5]
+STRESS_MAX_PASSAGES_PER_DOC = 6
 
 
 def _per_doc_filter(argument: str, doc: Doc, llm) -> list[int]:
@@ -328,6 +435,61 @@ def _doc_token_estimate(doc: Doc) -> int:
     return sum(len(c.clean) for c in doc.chunks) // 4
 
 
+MAX_CHUNKS_PER_PASSAGE = 2
+
+
+def _merge_adjacent(chunks: list[Chunk]) -> list[str]:
+    """Group chunks by contiguous chunk_index, split long runs into sub-runs
+    of at most MAX_CHUNKS_PER_PASSAGE. Returns one passage text per sub-run.
+    """
+    if not chunks:
+        return []
+    ordered = sorted(chunks, key=lambda c: c.chunk_index)
+    runs: list[list[Chunk]] = [[ordered[0]]]
+    for c in ordered[1:]:
+        if c.chunk_index == runs[-1][-1].chunk_index + 1:
+            runs[-1].append(c)
+        else:
+            runs.append([c])
+    sub_runs: list[list[Chunk]] = []
+    for run in runs:
+        for i in range(0, len(run), MAX_CHUNKS_PER_PASSAGE):
+            sub_runs.append(run[i : i + MAX_CHUNKS_PER_PASSAGE])
+    passages: list[str] = []
+    for run in sub_runs:
+        body = " ".join(c.clean for c in run)
+        text = f"{run[0].head} {body} {run[-1].tail}"
+        passages.append(" ".join(text.split()))
+    return passages
+
+
+def _parse_clusters(raw: str, passage_count: int) -> list[dict]:
+    """Parse LLM JSON output into validated clusters: [{stance, label, passages}]."""
+    match = re.search(r"\[.*\]", raw, re.DOTALL)
+    if not match:
+        return []
+    try:
+        data = json.loads(match.group(0))
+    except (json.JSONDecodeError, ValueError):
+        return []
+    clusters: list[dict] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        label = item.get("label")
+        passages = item.get("passages")
+        stance = str(item.get("stance", "ATTACKS")).upper().strip()
+        if stance not in ("SUPPORTS", "ATTACKS"):
+            stance = "ATTACKS"
+        if not isinstance(label, str) or not isinstance(passages, list):
+            continue
+        valid = [p for p in passages if isinstance(p, int) and 1 <= p <= passage_count]
+        label_clean = label.strip().rstrip(".").strip()
+        if label_clean and valid:
+            clusters.append({"stance": stance, "label": label_clean, "passages": valid})
+    return clusters
+
+
 def _stress_test(
     request: dict, docs: dict[str, Doc], bm25: BM25Index, cfg: Config, models: Models
 ) -> dict:
@@ -337,28 +499,19 @@ def _stress_test(
 
     logger.info("stress-test: argument (%d chars)", len(argument))
 
-    counter_qs = _counter_queries(argument, models.llm)
-    logger.info("stress-test: %d counter-queries generated", len(counter_qs))
+    # Direct hybrid search on the argument — no counter-queries (drift-prone).
+    # Per-doc LLM filter below does the adversarial selection.
+    q_vec = np.array(models.embedder.embed([argument])[0], dtype=np.float32)
+    hits = _hybrid_search(docs, bm25, q_vec, argument, STRESS_RETRIEVAL_K, cfg.alpha)
 
-    # Broad retrieval — direct + counter-queries, dedupe by chunk key
-    all_queries = [argument] + counter_qs
-    seen_chunks: dict[str, SearchHit] = {}
-    for q in all_queries:
-        q_vec = np.array(models.embedder.embed([q])[0], dtype=np.float32)
-        hits = _hybrid_search(docs, bm25, q_vec, q, STRESS_RETRIEVAL_K, cfg.alpha)
-        for h in hits:
-            key = f"{h.chunk.doc_id}:{h.chunk.chunk_index}"
-            if key not in seen_chunks or h.similarity > seen_chunks[key].similarity:
-                seen_chunks[key] = h
-
-    # Rank docs by best chunk score across all queries
+    # Aggregate to doc-level by best chunk score
     by_doc: dict[str, float] = {}
-    for h in seen_chunks.values():
+    for h in hits:
         did = h.chunk.doc_id
         if did not in by_doc or h.similarity > by_doc[did]:
             by_doc[did] = h.similarity
     top_doc_ids = sorted(by_doc, key=lambda d: by_doc[d], reverse=True)[:STRESS_MAX_DOCS]
-    logger.info("stress-test: %d candidate docs", len(top_doc_ids))
+    logger.info("stress-test: %d candidate docs from %d chunks", len(top_doc_ids), len(hits))
 
     # Size filter first, then fan out per-doc LLM in parallel
     fit_docs: list[Doc] = []
@@ -386,32 +539,102 @@ def _stress_test(
             "citations": [],
         }
 
-    # Final LLM — writes the mosaic letter from selected chunks
-    citations: list[dict] = []
-    context_parts: list[str] = []
-    idx = 1
+    # Merge adjacent selected chunks per doc, cap per-doc, interleave across docs
+    from itertools import zip_longest
+
+    per_doc: list[list[dict]] = []
     for doc_id, chunks in mosaics.items():
         doc = docs[doc_id]
-        label = _source_label(doc)
-        filename = doc.metadata.get("filename") or label
-        for c in chunks:
-            context_parts.append(f"[{idx}] (source: {label}) {c.clean}")
-            citations.append({
+        filename = _source_label(doc)
+        case_name = doc.metadata.get("case_name", "") or ""
+        doc_passages = [
+            {
                 "doc_id": doc.id,
-                "source": label,
                 "filename": filename,
-                "text": c.clean,
-                "score": 1.0,
-            })
-            idx += 1
+                "case_name": case_name,
+                "text": text,
+            }
+            for text in _merge_adjacent(chunks)[:STRESS_MAX_PASSAGES_PER_DOC]
+        ]
+        if doc_passages:
+            per_doc.append(doc_passages)
 
-    context = "\n\n".join(context_parts)
-    user_msg = f"Lawyer's position:\n{argument}\n\nPassages from archive:\n{context}"
-    answer = models.llm.chat(STRESS_SYSTEM_PROMPT, user_msg)
-    logger.info("stress-test: complete — %d docs in mosaic, %d citations, answer=%dchars", len(mosaics), len(citations), len(answer))
-    logger.info("stress-test: answer preview:\n%s", answer[:2000])
+    # Round-robin so the first slots in the LLM context span all docs
+    passages: list[dict] = [
+        p for group in zip_longest(*per_doc) for p in group if p is not None
+    ]
 
-    return {"ok": True, "answer": answer, "citations": citations}
+    def _p_label(p: dict) -> str:
+        return f"{p['case_name']} ({p['filename']})" if p["case_name"] else p["filename"]
+    context = "\n\n".join(
+        f"[{i+1}] (source: {_p_label(p)}) {p['text']}" for i, p in enumerate(passages)
+    )
+    user_msg = f"Argument:\n{argument}\n\nPassages:\n{context}"
+    raw = models.strong_llm.chat(MOSAIC_SYSTEM_PROMPT, user_msg)
+    all_clusters = _parse_clusters(raw, len(passages))
+    # Enforce single-source per cluster and unique-source across clusters
+    seen_docs: set[str] = set()
+    clusters: list[dict] = []
+    for c in all_clusters:
+        cluster_docs = {passages[p - 1]["doc_id"] for p in c["passages"]}
+        if len(cluster_docs) != 1:
+            continue
+        doc_id = next(iter(cluster_docs))
+        if doc_id in seen_docs:
+            continue
+        seen_docs.add(doc_id)
+        clusters.append(c)
+    logger.info(
+        "stress-test: LLM returned %d clusters → %d after single-source / unique-doc filter",
+        len(all_clusters), len(clusters),
+    )
+
+    if not clusters:
+        return {
+            "ok": True,
+            "answer": "No adversarial authorities found in the provided archive.",
+            "citations": [],
+        }
+
+    # Render: '## [FOR|AGAINST] <case_name> · <label>' per cluster
+    parts: list[str] = []
+    used: list[dict] = []
+    for cluster in clusters:
+        first = passages[cluster["passages"][0] - 1]
+        case_name = first["case_name"]
+        stance = cluster["stance"]
+        label = cluster["label"]
+        if case_name:
+            header = f"[{stance}] {case_name} · {label}"
+        else:
+            header = f"[{stance}] {label}"
+        parts.append(f"## {header}")
+        for p_num in cluster["passages"]:
+            passage = passages[p_num - 1]
+            parts.append(f"> {passage['text']}")
+            used.append(passage)
+        parts.append(f"— {first['filename']}")
+
+    raw_answer = "\n\n".join(parts)
+    logger.info(
+        "stress-test: mosaic — %d clusters, %d/%d passages, raw=%dchars",
+        len(clusters), len(used), len(passages), len(raw_answer),
+    )
+    for i, cluster in enumerate(clusters, 1):
+        first = passages[cluster["passages"][0] - 1]
+        logger.info("  cluster %d: [%s] %r case=%r file=%s n_passages=%d",
+                    i, cluster["stance"], cluster["label"],
+                    first["case_name"] or "(none)",
+                    first["filename"], len(cluster["passages"]))
+
+    # Stage 3: trim procedural water from passages, preserve structure
+    answer = models.llm.chat(TRIMMER_SYSTEM_PROMPT, raw_answer)
+    answer = answer.strip()
+    reduction = (1 - len(answer) / max(len(raw_answer), 1)) * 100
+    logger.info("stress-test: trimmed → %dchars (%.0f%% reduction)", len(answer), reduction)
+    logger.info("stress-test: final answer:\n%s", answer)
+
+    return {"ok": True, "answer": answer, "citations": used}
 
 
 def _hybrid_search(

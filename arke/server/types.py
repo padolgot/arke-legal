@@ -1,6 +1,6 @@
 import hashlib
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Iterator
+from typing import Any
 
 import numpy as np
 
@@ -40,53 +40,13 @@ class Chunk:
 
 @dataclass
 class Doc:
-    TABLE: ClassVar[str] = "documents"
-
     id: str
     source: str
     created: int
     modified: int
     metadata: dict[str, Any] = field(default_factory=dict)
     tags: list[str] = field(default_factory=list)
-
-    # Runtime only — re-grown on every unwrap, never serialized.
     chunks: list[Chunk] = field(default_factory=list, compare=False, repr=False)
-    _dirty: bool = field(default=False, compare=False, repr=False)
-
-    def wrap(self) -> dict:
-        return {
-            "id": self.id,
-            "source": self.source,
-            "created": self.created,
-            "modified": self.modified,
-            "metadata": self.metadata,
-            "tags": self.tags,
-        }
-
-    @classmethod
-    def unwrap(cls, d: dict) -> "Doc":
-        return cls(
-            id=d["id"],
-            source=d["source"],
-            created=d["created"],
-            modified=d["modified"],
-            metadata=d.get("metadata", {}),
-            tags=d.get("tags", []),
-        )
-
-    def save(self) -> None:
-        sdb.put_json(self.TABLE, self.id, self.wrap())
-        self._dirty = False
-
-    @classmethod
-    def load(cls, id: str) -> "Doc | None":
-        data = sdb.get_json(cls.TABLE, id)
-        return cls.unwrap(data) if data else None
-
-    @classmethod
-    def scan(cls) -> Iterator["Doc"]:
-        for _, data in sdb.scan_json(cls.TABLE):
-            yield cls.unwrap(data)
 
 
 @dataclass(frozen=True)
