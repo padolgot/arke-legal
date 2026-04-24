@@ -1,49 +1,36 @@
-"""Email client via Microsoft Graph polling.
+"""Email client via SendGrid — Inbound Parse webhook + SMTP relay.
 
-Every POLL_INTERVAL seconds, list unread messages in the inbox, fetch each,
-forward to arke-server, reply, mark read. No webhooks, no public ingress —
-purely outbound HTTPS to Graph.
+Inbound: SendGrid POSTs raw RFC 822 MIME to /inbound (multipart/form-data).
+We parse the email, forward to arke-server, wait for response, reply via SMTP.
 
-isRead=false is the source of truth for "needs answering". We mark-as-read
-before replying so a crash between steps leaves a silent miss, never a
-double reply.
+Outbound: smtplib over TLS to smtp.sendgrid.net:587, login "apikey" + API key.
+
+Threading: HTTP server spawns a thread per request so a long stress-test
+(1-3 min) doesn't block concurrent webhooks. Arke's mailbox is file-based
+with UUID keys — no shared state between threads.
 """
 
-import base64
+import email
+import email.policy
+import email.utils
 import logging
 import os
 import re
 import signal
-import time
-from collections.abc import Callable
+import smtplib
+import threading
 from dataclasses import dataclass
+from email.message import EmailMessage
+from email.parser import BytesParser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-
-import httpx
-import msal
 
 logger = logging.getLogger(__name__)
 
-GRAPH = "https://graph.microsoft.com/v1.0"
-SCOPE = ["https://graph.microsoft.com/.default"]
-POLL_INTERVAL_SEC = 5
-LIST_PAGE_SIZE = 50
-
-# Graph inline attachments are capped at ~4MB per reply. Skip any single file
-# above 3MB and stop attaching once the running total would exceed the budget —
-# a lawyer gets a neat set of small files or none at all, never a 400 from Graph.
-MAX_ATTACHMENT_BYTES = 3 * 1024 * 1024
-TOTAL_ATTACHMENT_BUDGET = 3 * 1024 * 1024
-
-MIME_TYPES = {
-    ".pdf": "application/pdf",
-    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    ".doc": "application/msword",
-    ".msg": "application/vnd.ms-outlook",
-    ".txt": "text/plain",
-    ".md": "text/markdown",
-    ".rtf": "application/rtf",
-}
+SMTP_HOST = "smtp.sendgrid.net"
+SMTP_PORT = 587
+SMTP_USER = "apikey"
+WEBHOOK_PORT = 8080
 
 EMAIL_STYLE = "font-family:Georgia,serif;font-size:11pt;line-height:1.55;color:#222"
 H3_STYLE = "margin:18px 0 8px 0"
@@ -66,10 +53,9 @@ FOOTER_HTML = (
 
 @dataclass(frozen=True)
 class EmailConfig:
-    tenant_id: str
-    client_id: str
-    client_secret: str
+    api_key: str
     mailbox: str
+    workspace_path: Path
 
     @staticmethod
     def from_env() -> "EmailConfig":
@@ -79,75 +65,69 @@ class EmailConfig:
                 raise ValueError(f"email config: {key} is required")
             return value
 
+        arke_root = Path(os.environ.get("ARKE_ROOT") or Path.home() / ".arke")
+        workspace = os.environ.get("ARKE_WORKSPACE", "default")
         return EmailConfig(
-            tenant_id=req("M365_TENANT_ID"),
-            client_id=req("M365_CLIENT_ID"),
-            client_secret=req("M365_CLIENT_SECRET"),
-            mailbox=req("M365_MAILBOX"),
+            api_key=req("SENDGRID_API_KEY"),
+            mailbox=req("ARKE_MAILBOX"),
+            workspace_path=arke_root / "workspaces" / workspace,
         )
 
 
-def _auth(token: str) -> dict[str, str]:
-    return {"Authorization": f"Bearer {token}"}
+# --- multipart + email parsing ------------------------------------------------
+
+def _parse_multipart(content_type: str, body: bytes) -> dict[str, bytes]:
+    """Parse multipart/form-data body → {field name: raw bytes}."""
+    header = f"Content-Type: {content_type}\n\n".encode()
+    msg = BytesParser(policy=email.policy.default).parsebytes(header + body)
+    fields: dict[str, bytes] = {}
+    for part in msg.iter_parts():
+        disposition = part.get("Content-Disposition", "")
+        name = None
+        for item in disposition.split(";"):
+            item = item.strip()
+            if item.startswith("name="):
+                name = item[5:].strip().strip('"')
+                break
+        if name:
+            payload = part.get_payload(decode=True)
+            if payload is not None:
+                fields[name] = payload
+    return fields
 
 
-def _send(call: Callable[[], httpx.Response], max_tries: int = 3) -> httpx.Response:
-    """Invoke a Graph request with retries on 429 and 5xx, exponential backoff.
+def _parse_rfc822(raw: bytes) -> tuple[str, str, str]:
+    """Extract (sender_addr, subject, plain_body) from raw RFC 822."""
+    msg = BytesParser(policy=email.policy.default).parsebytes(raw)
+    sender_raw = msg.get("From", "")
+    sender_addr = email.utils.parseaddr(sender_raw)[1]
+    subject = msg.get("Subject", "(no subject)")
 
-    401 is not retried — MSAL caches a valid token, so a rejection means a
-    deeper auth problem that should surface, not be masked.
-    """
-    delay = 1.0
-    for attempt in range(max_tries):
-        r = call()
-        last_attempt = attempt == max_tries - 1
-        if r.status_code == 429 and not last_attempt:
-            time.sleep(float(r.headers.get("Retry-After", delay)))
-            delay *= 2
-            continue
-        if 500 <= r.status_code < 600 and not last_attempt:
-            time.sleep(delay)
-            delay *= 2
-            continue
-        return r
-    raise RuntimeError("unreachable: _send always returns inside the loop")
+    body = ""
+    if msg.is_multipart():
+        for part in msg.walk():
+            if part.get_content_type() == "text/plain":
+                body = part.get_content()
+                break
+        if not body:
+            for part in msg.walk():
+                if part.get_content_type() == "text/html":
+                    html = part.get_content()
+                    body = re.sub(r"<[^>]+>", "", html)
+                    break
+    else:
+        body = msg.get_content()
 
-
-def acquire_token(app: msal.ConfidentialClientApplication) -> str:
-    result = app.acquire_token_for_client(scopes=SCOPE)
-    if "access_token" not in result:
-        raise RuntimeError(f"auth: {result.get('error_description', result)}")
-    return result["access_token"]
+    return sender_addr, subject, body.strip()
 
 
-def list_unread_ids(http: httpx.Client, token: str, mailbox: str) -> list[str]:
-    url = f"{GRAPH}/users/{mailbox}/mailFolders('inbox')/messages"
-    params = {
-        "$filter": "isRead eq false",
-        "$select": "id",
-        "$orderby": "receivedDateTime",
-        "$top": str(LIST_PAGE_SIZE),
-    }
-    r = _send(lambda: http.get(url, params=params, headers=_auth(token)))
-    r.raise_for_status()
-    return [m["id"] for m in r.json().get("value", [])]
-
-
-def fetch_message(http: httpx.Client, token: str, mailbox: str, msg_id: str) -> dict:
-    url = f"{GRAPH}/users/{mailbox}/messages/{msg_id}"
-    params = {"$select": "id,subject,from,body"}
-    headers = {**_auth(token), "Prefer": 'outlook.body-content-type="text"'}
-    r = _send(lambda: http.get(url, params=params, headers=headers))
-    r.raise_for_status()
-    return r.json()
-
+# --- rendering ----------------------------------------------------------------
 
 def _escape(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def _inline(text: str) -> str:
-    """Escape HTML then apply a minimal set of inline formats (**bold**)."""
     out = _escape(text)
     out = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", out)
     return out
@@ -164,12 +144,6 @@ def _is_block_start(line: str) -> bool:
 
 
 def _md_to_html(md: str) -> str:
-    """Minimal markdown→HTML for email bodies.
-
-    Supported: paragraphs, **bold**, ##/# headings, ordered and unordered lists,
-    > blockquotes. Deliberately narrow — we control the LLM's output format, so
-    we only render what we ask for and no exotic edge cases.
-    """
     lines = md.split("\n")
     parts: list[str] = []
     i = 0
@@ -224,7 +198,6 @@ def _md_to_html(md: str) -> str:
 
 
 def _build_html_reply(answer_md: str, citations: list[dict]) -> str:
-    """Wrap LLM answer + Sources block into a self-styled HTML fragment."""
     answer_html = _md_to_html(answer_md)
     parts = [f'<div style="{EMAIL_STYLE}">', answer_html]
 
@@ -246,160 +219,120 @@ def _build_html_reply(answer_md: str, citations: list[dict]) -> str:
     return "".join(parts)
 
 
-def _mime_type(filename: str) -> str:
-    ext = Path(filename).suffix.lower()
-    return MIME_TYPES.get(ext, "application/octet-stream")
+# --- SMTP ---------------------------------------------------------------------
+
+def _send_reply(cfg: EmailConfig, to: str, subject: str, html: str) -> None:
+    msg = EmailMessage()
+    msg["From"] = cfg.mailbox
+    msg["To"] = to
+    msg["Subject"] = subject
+    msg.set_content("Please view this message in an HTML-capable email client.")
+    msg.add_alternative(html, subtype="html")
+
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as s:
+        s.starttls()
+        s.login(SMTP_USER, cfg.api_key)
+        s.send_message(msg)
 
 
-def _source_bytes(workspace_path: Path, doc_id: str) -> bytes | None:
-    """Read a source file directly from the workspace sdb layout.
+# --- processing pipeline ------------------------------------------------------
 
-    sdb shards by the first two chars of the id; the email client reads the
-    file rather than mounting sdb because the server owns the mount and a
-    second mount from another process would race its atomic writes.
-    """
-    path = workspace_path / "data" / "sources" / doc_id[:2] / doc_id
-    if not path.exists():
-        return None
-    return path.read_bytes()
-
-
-def _build_attachments(citations: list[dict], workspace_path: Path) -> list[dict]:
-    """Dedupe citations by doc_id, read each source file, enforce size budget."""
-    attachments: list[dict] = []
-    seen: set[str] = set()
-    total = 0
-    for citation in citations:
-        doc_id = citation.get("doc_id")
-        if not doc_id or doc_id in seen:
-            continue
-        seen.add(doc_id)
-
-        data = _source_bytes(workspace_path, doc_id)
-        if data is None:
-            logger.info("attachment skipped: doc_id=%s reason=source-missing", doc_id)
-            continue
-        if len(data) > MAX_ATTACHMENT_BYTES:
-            logger.info("attachment skipped: doc_id=%s reason=oversize bytes=%d", doc_id, len(data))
-            continue
-        if total + len(data) > TOTAL_ATTACHMENT_BUDGET:
-            logger.info("attachment skipped: doc_id=%s reason=budget-exceeded", doc_id)
-            continue
-        total += len(data)
-
-        filename = citation.get("filename") or citation.get("source") or doc_id
-        attachments.append({
-            "@odata.type": "#microsoft.graph.fileAttachment",
-            "name": filename,
-            "contentBytes": base64.b64encode(data).decode(),
-            "contentType": _mime_type(filename),
-        })
-    return attachments
-
-
-def reply_to_message(
-    http: httpx.Client,
-    token: str,
-    mailbox: str,
-    msg_id: str,
-    html_body: str,
-    attachments: list[dict],
-) -> None:
-    url = f"{GRAPH}/users/{mailbox}/messages/{msg_id}/reply"
-    message: dict = {"body": {"contentType": "html", "content": html_body}}
-    if attachments:
-        message["attachments"] = attachments
-    body = {"message": message}
-    r = _send(lambda: http.post(url, json=body, headers=_auth(token)))
-    r.raise_for_status()
-
-
-def mark_as_read(http: httpx.Client, token: str, mailbox: str, msg_id: str) -> None:
-    url = f"{GRAPH}/users/{mailbox}/messages/{msg_id}"
-    body = {"isRead": True}
-    r = _send(lambda: http.patch(url, json=body, headers=_auth(token)))
-    r.raise_for_status()
-
-
-def process_message(
-    http: httpx.Client, token: str, mailbox: str, msg_id: str, workspace_path: Path
-) -> None:
+def _process_inbound(cfg: EmailConfig, raw_mime: bytes) -> None:
     from arke.server import mailbox as arke_mailbox
 
-    msg = fetch_message(http, token, mailbox, msg_id)
-    subject = msg.get("subject") or "(no subject)"
-    sender = (msg.get("from") or {}).get("emailAddress", {}).get("address", "unknown")
-    body_text = (msg.get("body") or {}).get("content", "").strip()
-    logger.info("received: %s (from %s)", subject, sender)
-
-    # Self-routed mail (a reply we sent that came back to the same mailbox)
-    # must never trigger another reply — that is the infinite loop. Mark read
-    # and bail. Graph's $filter cannot combine isRead with a nested sender
-    # filter, so we handle this client-side.
-    if sender.lower() == mailbox.lower():
-        mark_as_read(http, token, mailbox, msg_id)
+    try:
+        sender, subject, body_text = _parse_rfc822(raw_mime)
+    except Exception as e:
+        logger.exception("rfc822 parse failed: %s", e)
         return
 
-    query = body_text or subject
-    arke_msg_id = arke_mailbox.send({"cmd": "ask", "query": query}, workspace_path)
-    response = arke_mailbox.receive(arke_msg_id, workspace_path)
+    logger.info("received: %s (from %s)", subject, sender)
 
-    if response and response.get("ok"):
-        answer_md = response.get("answer", "No answer available.")
-        citations = response.get("citations", [])
-    else:
-        answer_md = "Arke could not process your request at this time."
-        citations = []
+    if sender.lower() == cfg.mailbox.lower():
+        logger.info("self-loop, dropped")
+        return
 
-    html_body = _build_html_reply(answer_md, citations)
-    attachments = _build_attachments(citations, workspace_path)
+    try:
+        query = body_text or subject
+        msg_id = arke_mailbox.send({"cmd": "stress", "argument": query}, cfg.workspace_path)
+        response = arke_mailbox.receive(msg_id, cfg.workspace_path)
 
-    # Mark read before replying: a crash between the two calls leaves a silent
-    # miss (user notices, resends) instead of a double reply (embarrassing).
-    mark_as_read(http, token, mailbox, msg_id)
-    reply_to_message(http, token, mailbox, msg_id, html_body, attachments)
+        if response and response.get("ok"):
+            answer_md = response.get("answer", "No answer available.")
+            citations = response.get("citations", [])
+        else:
+            answer_md = "Arke could not process your request at this time."
+            citations = []
+
+        html_body = _build_html_reply(answer_md, citations)
+        reply_subject = subject if subject.lower().startswith("re:") else f"Re: {subject}"
+        _send_reply(cfg, to=sender, subject=reply_subject, html=html_body)
+        logger.info("reply sent to %s", sender)
+    except Exception as e:
+        logger.exception("processing failed for %s: %s", sender, e)
+
+
+# --- HTTP server --------------------------------------------------------------
+
+def _make_handler(cfg: EmailConfig):
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            if self.path != "/inbound":
+                self.send_response(404)
+                self.end_headers()
+                return
+            raw: bytes | None = None
+            try:
+                content_type = self.headers.get("Content-Type", "")
+                length = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(length)
+                fields = _parse_multipart(content_type, body)
+                raw = fields.get("email")
+            except Exception as e:
+                logger.exception("inbound parse error: %s", e)
+
+            # ACK fast so SendGrid does not retry (default webhook timeout ~30s,
+            # stress-test takes 1-3 min). Processing runs in a background thread.
+            self.send_response(200)
+            self.end_headers()
+
+            if raw:
+                t = threading.Thread(target=_process_inbound, args=(cfg, raw), daemon=True)
+                t.start()
+            else:
+                logger.warning("inbound: no 'email' field in payload")
+
+        def do_GET(self):
+            if self.path == "/health":
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"ok")
+                return
+            self.send_response(404)
+            self.end_headers()
+
+        def log_message(self, format, *args):
+            logger.info("%s %s", self.client_address[0], format % args)
+
+    return Handler
 
 
 def _install_term_handler() -> None:
-    """Translate SIGTERM into KeyboardInterrupt so systemd/docker stop paths run
-    the same finally block as Ctrl-C. Python's default SIGTERM kills the process
-    mid-stride, skipping cleanup."""
-
-    def handler(signum: int, frame: object) -> None:
+    def handler(signum, frame):
         raise KeyboardInterrupt()
-
     signal.signal(signal.SIGTERM, handler)
 
 
-def run(cfg: EmailConfig, workspace_path: Path) -> None:
-    logger.info("email client starting (polling %ds), mailbox=%s", POLL_INTERVAL_SEC, cfg.mailbox)
+def run(cfg: EmailConfig) -> None:
+    logger.info("sendgrid client starting on :%d, mailbox=%s", WEBHOOK_PORT, cfg.mailbox)
     _install_term_handler()
-
-    msal_app = msal.ConfidentialClientApplication(
-        client_id=cfg.client_id,
-        client_credential=cfg.client_secret,
-        authority=f"https://login.microsoftonline.com/{cfg.tenant_id}",
-    )
-
-    with httpx.Client(timeout=30) as http:
-        try:
-            while True:
-                token = acquire_token(msal_app)
-                try:
-                    ids = list_unread_ids(http, token, cfg.mailbox)
-                except httpx.HTTPError as exc:
-                    logger.error("list unread failed: %s", exc)
-                    ids = []
-
-                for msg_id in ids:
-                    try:
-                        process_message(http, token, cfg.mailbox, msg_id, workspace_path)
-                    except httpx.HTTPError as exc:
-                        logger.error("process %s failed: %s", msg_id, exc)
-
-                time.sleep(POLL_INTERVAL_SEC)
-        except KeyboardInterrupt:
-            logger.info("shutting down")
+    handler_cls = _make_handler(cfg)
+    server = ThreadingHTTPServer(("127.0.0.1", WEBHOOK_PORT), handler_cls)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        logger.info("shutting down")
+        server.shutdown()
 
 
 def main() -> None:
@@ -407,12 +340,7 @@ def main() -> None:
 
     load_dotenv()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("httpcore").setLevel(logging.WARNING)
-    workspace_name = os.environ.get("ARKE_WORKSPACE", "default")
-    arke_root = Path(os.environ.get("ARKE_ROOT") or Path.home() / ".arke")
-    workspace_path = arke_root / "workspaces" / workspace_name
-    run(EmailConfig.from_env(), workspace_path)
+    run(EmailConfig.from_env())
 
 
 if __name__ == "__main__":

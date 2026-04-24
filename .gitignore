@@ -33,6 +33,6 @@ dist-ssr/
 CLAUDE.md
 .design/
 .research/
-.eval/
-.media/
+.workings
+media/
 todo.md

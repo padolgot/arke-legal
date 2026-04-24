@@ -11,8 +11,11 @@ Main loop (1-second pulse):
   - check digest → re-ingest if hash changed
 """
 import hashlib
+import json
 import logging
+import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -167,6 +170,9 @@ def _dispatch(request: dict, docs: dict[str, Doc], bm25: BM25Index, cfg: Config,
     if cmd == "ask":
         return _ask(request, docs, bm25, cfg, models)
 
+    if cmd == "stress":
+        return _stress_test(request, docs, bm25, cfg, models)
+
     if cmd == "ping":
         return {"ok": True, "pong": True}
 
@@ -243,6 +249,169 @@ def _sample(request: dict, docs: dict[str, Doc]) -> dict:
         {"doc_id": c.doc_id, "chunk_index": c.chunk_index, "clean": c.clean, "head": c.head, "tail": c.tail}
         for c in sample
     ]}
+
+
+# --- stress-test (adversarial authority) ------------------------------------
+
+COUNTER_QUERIES_PROMPT = (
+    "You receive a legal argument that a practising litigator wants to "
+    "stress-test. Generate 5 short search queries that would find authorities "
+    "in their own corpus that OPPOSE, LIMIT, or DISTINGUISH this position.\n"
+    "\n"
+    "Focus on: contrary precedents, doctrinal limits of the claimed principle, "
+    "cases with opposite ratio on similar facts, distinguishing authorities, "
+    "exceptions to the rule.\n"
+    "\n"
+    "Output: one query per line. No numbering. No explanations. 5 queries."
+)
+
+PER_DOC_PROMPT = (
+    "You analyse one document from a litigator's case archive. Identify chunks "
+    "that form an adversarial mosaic against the lawyer's argument — parts of "
+    "the document that would weaken, limit, or contradict the argument.\n"
+    "\n"
+    "Return ONLY a JSON array of chunk indices, e.g. [3, 7, 14, 22].\n"
+    "\n"
+    "Rules:\n"
+    "- Range 5-25 indices when the document has adversarial content.\n"
+    "- Return [] if the document contains nothing adversarial to the argument.\n"
+    "- Do not explain. Output only the JSON array."
+)
+
+STRESS_SYSTEM_PROMPT = (
+    "You are adverse counsel reviewing a lawyer's position. From their own "
+    "archive you receive passages that may weaken, limit, or contradict it. "
+    "Produce a citation mosaic showing what in the lawyer's own documents "
+    "cuts against their argument.\n"
+    "\n"
+    "Format (STRICT — do not deviate):\n"
+    "- Start directly with one opening sentence naming the main vulnerabilities. "
+    "No salutation, no 'Dear', no date, no 'Yours sincerely', no signature, no placeholders.\n"
+    "- Then 2-3 sections, each drawn from a DIFFERENT source document. "
+    "If you only use one source, that is a failure.\n"
+    "- Each section starts with '## ' followed by the source name.\n"
+    "- Under each heading, quote the relevant passages as '> ' blockquotes.\n"
+    "- After each quote, one sentence in plain prose explaining why it cuts "
+    "against the argument.\n"
+    "- British legal register. No advice, no opinion, no hedging.\n"
+    "- Skip sources that do not cut against the argument.\n"
+    "- Use ONLY the passages provided. Never invent case names or holdings."
+)
+
+STRESS_MAX_DOCS = 10
+STRESS_DOC_MAX_TOKENS = 50000
+STRESS_RETRIEVAL_K = 20
+STRESS_MAX_WORKERS = 3
+
+
+def _counter_queries(argument: str, llm) -> list[str]:
+    raw = llm.chat(COUNTER_QUERIES_PROMPT, argument)
+    queries = [q.strip(" -•*.\t").strip() for q in raw.splitlines()]
+    return [q for q in queries if q][:5]
+
+
+def _per_doc_filter(argument: str, doc: Doc, llm) -> list[int]:
+    chunks_block = "\n\n".join(f"[{i}] {c.clean}" for i, c in enumerate(doc.chunks))
+    user = f"Argument:\n{argument}\n\nDocument chunks:\n{chunks_block}"
+    raw = llm.chat(PER_DOC_PROMPT, user)
+    match = re.search(r'\[[\d,\s]*\]', raw)
+    if not match:
+        return []
+    try:
+        indices = json.loads(match.group(0))
+    except (json.JSONDecodeError, ValueError):
+        return []
+    return [i for i in indices if isinstance(i, int) and 0 <= i < len(doc.chunks)]
+
+
+def _doc_token_estimate(doc: Doc) -> int:
+    return sum(len(c.clean) for c in doc.chunks) // 4
+
+
+def _stress_test(
+    request: dict, docs: dict[str, Doc], bm25: BM25Index, cfg: Config, models: Models
+) -> dict:
+    argument = request.get("argument") or request.get("query") or ""
+    if not argument:
+        return {"ok": False, "error": "argument is required"}
+
+    logger.info("stress-test: argument (%d chars)", len(argument))
+
+    counter_qs = _counter_queries(argument, models.llm)
+    logger.info("stress-test: %d counter-queries generated", len(counter_qs))
+
+    # Broad retrieval — direct + counter-queries, dedupe by chunk key
+    all_queries = [argument] + counter_qs
+    seen_chunks: dict[str, SearchHit] = {}
+    for q in all_queries:
+        q_vec = np.array(models.embedder.embed([q])[0], dtype=np.float32)
+        hits = _hybrid_search(docs, bm25, q_vec, q, STRESS_RETRIEVAL_K, cfg.alpha)
+        for h in hits:
+            key = f"{h.chunk.doc_id}:{h.chunk.chunk_index}"
+            if key not in seen_chunks or h.similarity > seen_chunks[key].similarity:
+                seen_chunks[key] = h
+
+    # Rank docs by best chunk score across all queries
+    by_doc: dict[str, float] = {}
+    for h in seen_chunks.values():
+        did = h.chunk.doc_id
+        if did not in by_doc or h.similarity > by_doc[did]:
+            by_doc[did] = h.similarity
+    top_doc_ids = sorted(by_doc, key=lambda d: by_doc[d], reverse=True)[:STRESS_MAX_DOCS]
+    logger.info("stress-test: %d candidate docs", len(top_doc_ids))
+
+    # Size filter first, then fan out per-doc LLM in parallel
+    fit_docs: list[Doc] = []
+    for doc_id in top_doc_ids:
+        doc = docs[doc_id]
+        est = _doc_token_estimate(doc)
+        if est > STRESS_DOC_MAX_TOKENS:
+            logger.info("stress-test: skip %s (%dk tokens)", _source_label(doc), est // 1000)
+            continue
+        fit_docs.append(doc)
+
+    mosaics: dict[str, list[Chunk]] = {}
+    if fit_docs:
+        with ThreadPoolExecutor(max_workers=min(STRESS_MAX_WORKERS, len(fit_docs))) as ex:
+            results = list(ex.map(lambda d: (d, _per_doc_filter(argument, d, models.llm)), fit_docs))
+        for doc, indices in results:
+            if indices:
+                mosaics[doc.id] = [doc.chunks[i] for i in indices]
+            logger.info("stress-test: %s → %d/%d chunks", _source_label(doc), len(indices), len(doc.chunks))
+
+    if not mosaics:
+        return {
+            "ok": True,
+            "answer": "No adversarial authorities found in the provided archive.",
+            "citations": [],
+        }
+
+    # Final LLM — writes the mosaic letter from selected chunks
+    citations: list[dict] = []
+    context_parts: list[str] = []
+    idx = 1
+    for doc_id, chunks in mosaics.items():
+        doc = docs[doc_id]
+        label = _source_label(doc)
+        filename = doc.metadata.get("filename") or label
+        for c in chunks:
+            context_parts.append(f"[{idx}] (source: {label}) {c.clean}")
+            citations.append({
+                "doc_id": doc.id,
+                "source": label,
+                "filename": filename,
+                "text": c.clean,
+                "score": 1.0,
+            })
+            idx += 1
+
+    context = "\n\n".join(context_parts)
+    user_msg = f"Lawyer's position:\n{argument}\n\nPassages from archive:\n{context}"
+    answer = models.llm.chat(STRESS_SYSTEM_PROMPT, user_msg)
+    logger.info("stress-test: complete — %d docs in mosaic, %d citations, answer=%dchars", len(mosaics), len(citations), len(answer))
+    logger.info("stress-test: answer preview:\n%s", answer[:2000])
+
+    return {"ok": True, "answer": answer, "citations": citations}
 
 
 def _hybrid_search(

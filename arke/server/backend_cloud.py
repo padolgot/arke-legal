@@ -1,11 +1,14 @@
 """Cloud backend — OpenAI API via HTTP."""
 import json
 import logging
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 
 EMBED_BATCH_SIZE = 2048
+RETRY_ATTEMPTS = 5
+RETRY_BASE_DELAY = 2.0
 
 logger = logging.getLogger(__name__)
 
@@ -68,5 +71,18 @@ def _post(base_url: str, api_key: str, path: str, body: dict) -> dict:
             "Authorization": f"Bearer {api_key}",
         },
     )
-    with urllib.request.urlopen(req, timeout=120) as resp:
-        return json.loads(resp.read())
+    delay = RETRY_BASE_DELAY
+    for attempt in range(RETRY_ATTEMPTS):
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                return json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            retriable = e.code == 429 or 500 <= e.code < 600
+            last_attempt = attempt == RETRY_ATTEMPTS - 1
+            if not retriable or last_attempt:
+                raise
+            retry_after = e.headers.get("Retry-After") if e.headers else None
+            wait = float(retry_after) if retry_after and retry_after.replace(".", "").isdigit() else delay
+            logger.warning("cloud %s %d — retry in %.1fs (attempt %d/%d)", path, e.code, wait, attempt + 1, RETRY_ATTEMPTS)
+            time.sleep(wait)
+            delay *= 2

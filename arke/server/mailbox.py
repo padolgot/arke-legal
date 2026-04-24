@@ -12,8 +12,8 @@ import time
 import uuid
 from pathlib import Path
 
-POLL_INTERVAL = 0.1   # seconds between outbox polls
-POLL_TIMEOUT  = 120.0 # max seconds to wait for a response
+POLL_INTERVAL = 0.01  # client-side: how often receive() checks outbox for its response
+POLL_TIMEOUT  = 600.0 # stress-test can run 1-3 min sequentially
 
 _inbox:  Path | None = None
 _outbox: Path | None = None
