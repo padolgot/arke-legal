@@ -1,0 +1,87 @@
+#!/bin/bash
+# 1. Run tests — block commit if they fail
+# 2. Auto-patch version: hours since last major.minor bump
+
+[ -f pyproject.toml ] || exit 0
+
+# --- Source dump ---
+{
+    echo "# Arke Terminal — Source Dump"
+    echo "# Generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo ""
+    [ -f README.md ] && {
+        echo "# ═══════════════════════════════════════════"
+        echo "# README.md"
+        echo "# ═══════════════════════════════════════════"
+        echo ""
+        cat README.md
+        echo ""
+    }
+    for f in $(find arke/ -name "*.py" -type f 2>/dev/null | sort); do
+        echo ""
+        echo "# ═══════════════════════════════════════════"
+        echo "# $f"
+        echo "# ═══════════════════════════════════════════"
+        echo ""
+        cat "$f"
+    done
+    echo ""
+    echo "# ═══════════════════════════════════════════"
+    echo "# pyproject.toml"
+    echo "# ═══════════════════════════════════════════"
+    echo ""
+    cat pyproject.toml
+    [ -f .env.example ] && {
+        echo ""
+        echo "# ═══════════════════════════════════════════"
+        echo "# .env.example"
+        echo "# ═══════════════════════════════════════════"
+        echo ""
+        cat .env.example
+    }
+} > source.txt
+git add source.txt
+
+# --- Tests ---
+if [ -d tests ]; then
+    uv run --extra dev pytest tests/ -q 2>&1
+    if [ $? -ne 0 ]; then
+        echo "commit blocked: tests failed"
+        exit 1
+    fi
+fi
+
+# --- Version bump ---
+grep -q '^version = ' pyproject.toml || exit 0
+
+CURRENT=$(grep '^version = ' pyproject.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+MAJOR_MINOR=$(echo "$CURRENT" | cut -d. -f1,2)
+
+EPOCH=$(git log --all --format=%ct -1 -- /dev/null 2>/dev/null)
+while read -r HASH TS; do
+    V=$(git show "$HASH:pyproject.toml" 2>/dev/null | grep '^version = ' | head -1 | sed 's/version = "\(.*\)"/\1/')
+    VM=$(echo "$V" | cut -d. -f1,2)
+    if [ "$VM" != "$MAJOR_MINOR" ]; then
+        break
+    fi
+    EPOCH=$TS
+done < <(git log --format="%H %ct" -- pyproject.toml 2>/dev/null)
+
+if [ -z "$EPOCH" ]; then
+    EPOCH=$(git log --reverse --format=%ct 2>/dev/null | head -1)
+fi
+
+if [ -z "$EPOCH" ]; then
+    exit 0
+fi
+
+NOW=$(date +%s)
+HOURS=$(( (NOW - EPOCH) / 3600 ))
+
+NEW_VERSION="${MAJOR_MINOR}.${HOURS}"
+
+if [ "$CURRENT" != "$NEW_VERSION" ]; then
+    sed -i "s/^version = .*/version = \"$NEW_VERSION\"/" pyproject.toml
+    uv lock --quiet 2>/dev/null
+    git add pyproject.toml uv.lock
+fi
