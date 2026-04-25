@@ -1,6 +1,6 @@
 [project]
 name = "arke-legal"
-version = "0.1.355"
+version = "0.1.382"
 description = "Local-first RAG for legal teams."
 requires-python = ">=3.12"
 license = "MIT"
@@ -39,7 +39,7 @@ Repository = "https://github.com/padolgot/arke-legal"
 [project.scripts]
 arke-server  = "arke.server.main:main"
 arke         = "arke.clients.cli:main"
-arke-eval    = "arke.eval.sweep:run"
+arke-eval    = "arke.eval.sweep:main"
 arke-mail    = "arke.clients.email:main"
 arke-sync    = "arke.digest.sync:main"
 

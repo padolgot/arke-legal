@@ -6,8 +6,6 @@ Arke reads your firm's corpus and answers your questions with direct citations �
 
 Arke never edits your documents — it only caches them, read-only. Worst case, you get a weak stress-test; your data stays on your server and never leaves your network. Best case, you have an always-available sparring partner stress-testing your arguments before court.
 
----
-
 ## How it's built
 
 A single Python process. Three one-way pipes in the shape of a **T** with a hat.
@@ -22,11 +20,9 @@ A single Python process. Three one-way pipes in the shape of a **T** with a hat.
 
 No Postgres. No Docker. No vector DB. No third-party framework. Everything lives in RAM while running and in plain JSON on disk.
 
----
-
 ## Interfaces
 
-**Email** — primary. Self-hosted, on your server. A lawyer sends a question to `ask@yourfirm.legal`; Arke replies with citations.
+**Email** — primary. Self-hosted, on your server. A lawyer sends a question to `arke@yourfirm.com`; Arke replies with citations.
 
 ```bash
 arke-mail
@@ -52,8 +48,6 @@ arke-eval --space legalbench --level medium --limit 50
 arke-sync
 ```
 
----
-
 ## Backends
 
 | Backend | When to use                                                    |
@@ -61,13 +55,9 @@ arke-sync
 | `local` | Production. GPU server, `.gguf` models. Zero external calls.   |
 | `cloud` | BAILII/LegalBench eval and development. OpenAI-compatible API. |
 
----
-
 ## Input formats
 
 PDF, DOCX, MSG (Outlook), TXT, Markdown.
-
----
 
 ## Configuration
 
@@ -81,13 +71,9 @@ All via environment variables (`.env`):
 | `ALPHA` | `0.7` | Blend: 1.0 = pure semantic, 0.0 = pure keyword |
 | `K` | `5` | Top-k results passed to LLM |
 
----
-
 ## Getting it into your firm
 
 Arke is open source under MIT. Clone it, run it, own it.
-
----
 
 ## Public demo
 

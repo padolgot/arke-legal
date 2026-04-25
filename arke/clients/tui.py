@@ -1,27 +1,25 @@
 """TUI client. Run: python -m arke.clients.tui"""
-# TODO: replace with Textual when we wire up the UI
-# For now: minimal readline loop so we can test mailbox end-to-end
+import os
 
-import sys
-
-from arke.server import mailbox
+from arke.server import mailbox, workspace
 
 
 def run() -> None:
-    print("Arke TUI — type your question, Ctrl-C to exit\n")
+    ws = workspace.path_for(os.environ.get("ARKE_WORKSPACE", "default"))
+    print("Arke TUI — paste your argument, Ctrl-C to exit\n")
 
     while True:
         try:
-            query = input("> ").strip()
+            argument = input("> ").strip()
         except (KeyboardInterrupt, EOFError):
             print()
             break
 
-        if not query:
+        if not argument:
             continue
 
-        msg_id = mailbox.send({"cmd": "ask", "query": query})
-        response = mailbox.receive(msg_id)
+        msg_id = mailbox.send({"cmd": "stress", "argument": argument}, ws)
+        response = mailbox.receive(msg_id, ws)
 
         if response is None:
             print("error: arke did not respond\n")
@@ -32,10 +30,6 @@ def run() -> None:
             continue
 
         print(f"\n{response['answer']}\n")
-
-        for cite in response.get("citations", []):
-            print(f"  [{cite['source']}] {cite['text'][:80]}...")
-        print()
 
 
 if __name__ == "__main__":

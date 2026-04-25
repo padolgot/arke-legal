@@ -1,11 +1,16 @@
-"""Sweep — run eval across preset configs and rank by MRR.
+"""Sweep — run retrieval eval across preset configs and rank by recall.
 
-Each config row = full arke-server restart with that config.
-Communicates through mailbox like any real client.
+For each config: stop the server, restart with the new config (full re-ingest
+from cold), run all eval cases through the server's `search` handler, score.
+
+Restart-per-config is the design — Arke is a real-time process whose config
+is immutable for its lifetime. No in-process swaps.
 
 Usage:
-    python -m arke.eval.sweep --workspace legalbench --level medium --limit 50
+    arke-eval --workspace cat --cases path/to/cases.jsonl --level medium
 """
+import json
+import logging
 import os
 import signal
 import subprocess
@@ -14,20 +19,27 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from arke.server import mailbox
+from arke.server import mailbox, workspace
 from arke.server.config import Config
-from arke.server.models import Models
-from arke.server.types import Doc
 
-from .gen import EvalCase, make_cases
 from .presets import get_preset
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class EvalCase:
+    """One retrieval probe — query plus the set of doc_ids the corpus
+    expects the system to recover. For citation-graph eval, expected_doc_ids
+    is the set of cases the source judgment cited."""
+    query: str
+    expected_doc_ids: set[str]
 
 
 @dataclass(frozen=True)
 class EvalMetrics:
-    precision: float
-    recall: float
-    mrr: float
+    recall: float        # mean fraction of expected docs found in top-k
+    mrr: float           # mean reciprocal rank of the FIRST expected match
 
 
 @dataclass(frozen=True)
@@ -36,90 +48,89 @@ class SweepRow:
     metrics: EvalMetrics
 
 
-def run(workspace: str, level: str, limit: int) -> list[SweepRow]:
+def run(workspace_name: str, cases_path: Path, level: str) -> list[SweepRow]:
     base_cfg = Config.from_env().resolved()
     configs = get_preset(level, base_cfg)
 
-    # Generate eval cases using base config (one-time)
-    print("generating eval cases...")
-    cases = _generate_cases(workspace, base_cfg, limit)
+    cases = _load_cases(cases_path)
     if not cases:
-        print("error: no eval cases generated", file=sys.stderr)
+        logger.error("no eval cases loaded from %s", cases_path)
         sys.exit(1)
-    print(f"generated {len(cases)} cases\n")
+    logger.info("loaded %d cases from %s", len(cases), cases_path)
 
     rows: list[SweepRow] = []
     for idx, cfg in enumerate(configs):
-        print(f"[{idx + 1}/{len(configs)}] chunk={cfg.chunk_size} overlap={cfg.overlap} alpha={cfg.alpha} k={cfg.k}")
-        metrics = _run_row(workspace, cfg, cases)
+        logger.info(
+            "[%d/%d] chunk=%d overlap=%.2f alpha=%.2f k=%d",
+            idx + 1, len(configs), cfg.chunk_size, cfg.overlap, cfg.alpha, cfg.k,
+        )
+        metrics = _run_row(workspace_name, cfg, cases)
         rows.append(SweepRow(cfg=cfg, metrics=metrics))
-        print(f"  → precision={metrics.precision:.3f} recall={metrics.recall:.3f} MRR={metrics.mrr:.3f}\n")
+        logger.info("  → recall=%.3f MRR=%.3f", metrics.recall, metrics.mrr)
 
-    rows.sort(key=lambda r: r.metrics.mrr, reverse=True)
+    rows.sort(key=lambda r: r.metrics.recall, reverse=True)
     _print_table(rows)
     return rows
 
 
-def _ws_path(workspace: str) -> Path:
-    return Path.home() / ".arke" / "workspaces" / workspace
+def _load_cases(path: Path) -> list[EvalCase]:
+    """Read JSONL: one {"query": str, "expected_doc_ids": [str, ...]} per line."""
+    cases: list[EvalCase] = []
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        obj = json.loads(line)
+        cases.append(EvalCase(
+            query=obj["query"],
+            expected_doc_ids=set(obj["expected_doc_ids"]),
+        ))
+    return cases
 
 
-def _generate_cases(workspace: str, cfg: Config, limit: int) -> list[EvalCase]:
-    """Start server, sample chunks, generate questions, stop server."""
-    proc = _start_server(workspace, cfg)
-    ws_path = _ws_path(workspace)
+def _run_row(workspace_name: str, cfg: Config, cases: list[EvalCase]) -> EvalMetrics:
+    proc = _start_server(workspace_name, cfg)
+    ws_path = workspace.path_for(workspace_name)
     try:
-        _wait_ready(ws_path)
-        msg_id = mailbox.send({"cmd": "sample", "limit": limit}, ws_path)
-        response = mailbox.receive(msg_id, ws_path)
-        if not response or not response.get("ok"):
-            raise RuntimeError(f"sample failed: {response}")
-
-        # load models for case generation (cloud preferred for quality)
-        models = Models.load(cfg)
-        from arke.server.types import Chunk
-        chunks = [
-            Chunk(doc_id=c["doc_id"], chunk_index=c["chunk_index"], clean=c["clean"], head=c["head"], tail=c["tail"])
-            for c in response["chunks"]
-        ]
-        return make_cases(models.llm, chunks, limit)
-    finally:
-        _stop_server(proc)
-
-
-def _run_row(workspace: str, cfg: Config, cases: list[EvalCase]) -> EvalMetrics:
-    proc = _start_server(workspace, cfg)
-    ws_path = _ws_path(workspace)
-    try:
-        _wait_ready(ws_path)
-        results = []
+        _wait_ready(proc, ws_path)
+        results: list[tuple[list[str], set[str]]] = []
         for case in cases:
-            msg_id = mailbox.send({"cmd": "ask", "query": case.query}, ws_path)
+            msg_id = mailbox.send({"cmd": "search", "query": case.query}, ws_path)
             response = mailbox.receive(msg_id, ws_path)
-            hits = response.get("citations", []) if response and response.get("ok") else []
-            results.append((hits, case.expected_key))
+            citations = response.get("citations", []) if response and response.get("ok") else []
+            # Preserve order (server returns sorted by score) and dedupe doc-ids
+            # while keeping the FIRST occurrence — MRR cares about earliest hit.
+            seen: set[str] = set()
+            retrieved: list[str] = []
+            for c in citations:
+                did = c["doc_id"]
+                if did in seen:
+                    continue
+                seen.add(did)
+                retrieved.append(did)
+            results.append((retrieved, case.expected_doc_ids))
         return _score(results)
     finally:
         _stop_server(proc)
 
 
-def _start_server(workspace: str, cfg: Config) -> subprocess.Popen:
+def _start_server(workspace_name: str, cfg: Config) -> subprocess.Popen:
     env = {
         **os.environ,
-        "ARKE_WORKSPACE": workspace,
+        "ARKE_WORKSPACE": workspace_name,
         "CHUNK_SIZE": str(cfg.chunk_size),
         "OVERLAP": str(cfg.overlap),
         "ALPHA": str(cfg.alpha),
         "K": str(cfg.k),
     }
-    proc = subprocess.Popen(["arke-server"], env=env)
-    return proc
+    return subprocess.Popen(["arke-server"], env=env)
 
 
-def _wait_ready(ws_path: Path, timeout: float = 60.0) -> None:
-    """Poll ping until server responds or timeout."""
+def _wait_ready(proc: subprocess.Popen, ws_path: Path, timeout: float = 60.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise RuntimeError(f"arke-server exited early (code={proc.returncode})")
         try:
             msg_id = mailbox.send({"cmd": "ping"}, ws_path)
             response = mailbox.receive(msg_id, ws_path)
@@ -139,49 +150,53 @@ def _stop_server(proc: subprocess.Popen) -> None:
         proc.kill()
 
 
-def _score(results: list[tuple[list, str]]) -> EvalMetrics:
+def _score(results: list[tuple[list[str], set[str]]]) -> EvalMetrics:
     n = len(results)
     if n == 0:
-        return EvalMetrics(precision=0.0, recall=0.0, mrr=0.0)
+        return EvalMetrics(recall=0.0, mrr=0.0)
 
-    sum_p = sum_r = sum_rr = 0.0
-    for hits, expected_key in results:
-        hit_keys = [f"{h['source']}:{h.get('chunk_index', '')}" for h in hits]
-        matched = sum(1 for k in hit_keys if k == expected_key)
-
-        sum_p += matched / len(hits) if hits else 0.0
-        sum_r += float(matched > 0)
-
-        for i, k in enumerate(hit_keys):
-            if k == expected_key:
+    sum_recall = sum_rr = 0.0
+    for retrieved, expected in results:
+        if not expected:
+            continue
+        sum_recall += len(set(retrieved) & expected) / len(expected)
+        for i, did in enumerate(retrieved):
+            if did in expected:
                 sum_rr += 1.0 / (i + 1)
                 break
 
-    return EvalMetrics(precision=sum_p / n, recall=sum_r / n, mrr=sum_rr / n)
+    return EvalMetrics(recall=sum_recall / n, mrr=sum_rr / n)
 
 
 def _print_table(rows: list[SweepRow]) -> None:
-    header = f"{'chunk':>6} {'overlap':>7} {'alpha':>6} {'k':>4} {'prec':>7} {'recall':>7} {'MRR':>7}"
-    print(f"\n{'Sweep Results (sorted by MRR)':^50}")
+    header = f"{'chunk':>6} {'overlap':>7} {'alpha':>6} {'k':>4} {'recall':>7} {'MRR':>7}"
+    print(f"\n{'Sweep Results (sorted by recall)':^50}")
     print(header)
     print("-" * len(header))
-    best_mrr = rows[0].metrics.mrr if rows else 0.0
+    best_recall = rows[0].metrics.recall if rows else 0.0
     for r in rows:
-        mrr_str = f"{r.metrics.mrr:.3f}"
-        if r.metrics.mrr == best_mrr:
-            mrr_str += " <-- best"
+        recall_str = f"{r.metrics.recall:.3f}"
+        if r.metrics.recall == best_recall:
+            recall_str += " <-- best"
         print(
-            f"{r.cfg.chunk_size:>6} {r.cfg.overlap:>7.1f} {r.cfg.alpha:>6.1f} {r.cfg.k:>4}"
-            f" {r.metrics.precision:>7.3f} {r.metrics.recall:>7.3f} {mrr_str}"
+            f"{r.cfg.chunk_size:>6} {r.cfg.overlap:>7.2f} {r.cfg.alpha:>6.2f} {r.cfg.k:>4}"
+            f" {recall_str:>7} {r.metrics.mrr:>7.3f}"
         )
     print()
 
 
-if __name__ == "__main__":
+def main() -> None:
     import argparse
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     parser = argparse.ArgumentParser()
     parser.add_argument("--workspace", required=True)
-    parser.add_argument("--level", default="medium")
-    parser.add_argument("--limit", type=int, default=50)
+    parser.add_argument("--cases", required=True, type=Path,
+                        help="JSONL file: {query, expected_doc_ids} per line")
+    parser.add_argument("--level", default="medium", help="fast | medium | thorough")
     args = parser.parse_args()
-    run(args.workspace, args.level, args.limit)
+    run(args.workspace, args.cases, args.level)
+
+
+if __name__ == "__main__":
+    main()

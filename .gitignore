@@ -5,34 +5,19 @@ __pycache__/
 *.egg-info/
 build/
 dist/
-.venv/
 venv/
 
-# Env
+# All dot-directories
+.*/
+
+# Env files
 .env
 .env.*
 !.env.example
 
-# Editors
-.idea/
-.vscode/
-
 # Logs
 *.log
 
-# Cache
-.cache/
-
-# Node / Vite
-node_modules/
-dist/
-dist-ssr/
-*.local
-
-# Project-local notes
+# Project-local
 CLAUDE.md
-.design/
-.research/
-.workings
 media/
-todo.md

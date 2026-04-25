@@ -1,12 +1,14 @@
-"""CLI client. Usage: arke ask "your question" """
+"""CLI client. Usage: arke stress "your argument" """
+import os
 import sys
 
-from arke.server import mailbox
+from arke.server import mailbox, workspace
 
 
-def ask(query: str) -> None:
-    msg_id = mailbox.send({"cmd": "ask", "query": query})
-    response = mailbox.receive(msg_id)
+def stress(argument: str) -> None:
+    ws = workspace.path_for(os.environ.get("ARKE_WORKSPACE", "default"))
+    msg_id = mailbox.send({"cmd": "stress", "argument": argument}, ws)
+    response = mailbox.receive(msg_id, ws)
 
     if response is None:
         print("error: arke did not respond", file=sys.stderr)
@@ -18,13 +20,10 @@ def ask(query: str) -> None:
 
     print(response["answer"])
 
-    for cite in response.get("citations", []):
-        print(f"  [{cite['source']}] {cite['text'][:80]}...")
-
 
 def main() -> None:
-    if len(sys.argv) < 3 or sys.argv[1] != "ask":
-        print("usage: arke ask <query>")
+    if len(sys.argv) < 3 or sys.argv[1] != "stress":
+        print("usage: arke stress <argument>")
         sys.exit(1)
 
-    ask(" ".join(sys.argv[2:]))
+    stress(" ".join(sys.argv[2:]))

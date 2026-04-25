@@ -20,7 +20,8 @@ class Config:
     cloud_api_key: str = ""
     cloud_base_url: str = "https://api.openai.com"
     cloud_embed_model: str = "text-embedding-3-small"
-    cloud_inference_model: str = "gpt-4o"
+    cloud_fast_model: str = "gpt-4o-mini"   # fast/cheap — per-doc filter, trimmer, ingest case-names
+    cloud_strong_model: str = "gpt-4o"      # judgment — mosaic clustering
 
     # RAG parameters
     embedding_dim: int = 0
@@ -64,7 +65,8 @@ class Config:
             cloud_api_key=os.environ.get("CLOUD_API_KEY", ""),
             cloud_base_url=os.environ.get("CLOUD_BASE_URL", "https://api.openai.com"),
             cloud_embed_model=os.environ.get("CLOUD_EMBED_MODEL", "text-embedding-3-small"),
-            cloud_inference_model=os.environ.get("CLOUD_INFERENCE_MODEL", "gpt-4o"),
+            cloud_fast_model=os.environ.get("CLOUD_FAST_MODEL", "gpt-4o-mini"),
+            cloud_strong_model=os.environ.get("CLOUD_STRONG_MODEL", "gpt-4o"),
             embedding_dim=int(os.environ.get("EMBEDDING_DIM", "0")),
             chunk_size=int(os.environ.get("CHUNK_SIZE", "600")),
             overlap=float(os.environ.get("OVERLAP", "0.0")),

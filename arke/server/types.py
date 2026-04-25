@@ -1,5 +1,6 @@
 import hashlib
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -15,14 +16,28 @@ class Chunk:
     head: str
     tail: str
 
+    # Set after case-name extraction so the embedder sees the chunk anchored
+    # to its document identity. Empty = no header (fallback for non-judgment docs).
+    context_header: str = ""
+
     # Runtime only — not serialized. Loaded from sdb.get_vec or computed on GPU.
     embedding: np.ndarray | None = field(default=None, compare=False, repr=False)
 
     def overlapped(self) -> str:
         return self.head + self.clean + self.tail
 
+    def baked(self) -> str:
+        """Exact text the embedder consumes — overlapped chunk with the
+        contextual header prepended. cache_key keys off this so any change
+        to the recipe (header content, format) auto-invalidates the cache."""
+        if self.context_header:
+            return f"{self.context_header}\n\n{self.overlapped()}"
+        return self.overlapped()
+
     def cache_key(self, model_id: str, model_version: str) -> str:
-        raw = f"{model_id}:{model_version}:{self.overlapped()}"
+        # Strip path so a model relocated on disk doesn't invalidate the cache.
+        model_short = Path(model_id).name
+        raw = f"{model_short}:{model_version}:{self.baked()}"
         return hashlib.md5(raw.encode()).hexdigest()
 
     def save_embedding(self, model_id: str, model_version: str) -> None:
@@ -48,14 +63,12 @@ class Doc:
     tags: list[str] = field(default_factory=list)
     chunks: list[Chunk] = field(default_factory=list, compare=False, repr=False)
 
+    @property
+    def label(self) -> str:
+        return self.metadata.get("filename") or self.source or self.id[:8]
+
 
 @dataclass(frozen=True)
 class SearchHit:
     chunk: Chunk
     similarity: float
-
-
-@dataclass(frozen=True)
-class SearchAnswer:
-    answer: str
-    hits: list[SearchHit]

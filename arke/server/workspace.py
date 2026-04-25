@@ -48,8 +48,14 @@ class Workspace:
 
 def mount(name: str, home: str | Path = ARKE_HOME) -> Workspace:
     """Mount a workspace by name. Sets the sdb root."""
-    path = Path(home).expanduser() / "workspaces" / name
+    path = path_for(name, home)
     path.mkdir(parents=True, exist_ok=True)
     ws = Workspace(name=name, path=path)
     sdb.mount(ws.data)
     return ws
+
+
+def path_for(name: str, home: str | Path = ARKE_HOME) -> Path:
+    """Resolve a workspace path without mounting it (no sdb side effects).
+    Used by clients/eval that talk to a running server through its mailbox."""
+    return Path(home).expanduser() / "workspaces" / name
