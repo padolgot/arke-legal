@@ -1,5 +1,5 @@
 # Arke Terminal — Source Dump
-# Generated: 2026-04-25T20:54:51Z
+# Generated: 2026-04-25T20:57:02Z
 
 # ═══════════════════════════════════════════
 # README.md
@@ -2543,8 +2543,8 @@ def path_for(name: str, home: str | Path = ARKE_HOME) -> Path:
 # ═══════════════════════════════════════════
 
 [project]
-name = "arke-legal"
-version = "0.1.355"
+name = "arke"
+version = "0.1.382"
 description = "Local-first RAG for legal teams."
 requires-python = ">=3.12"
 license = "MIT"
@@ -2578,7 +2578,7 @@ dev = [
 ]
 
 [project.urls]
-Repository = "https://github.com/padolgot/arke-legal"
+Repository = "https://github.com/padolgot/arke"
 
 [project.scripts]
 arke-server  = "arke.server.main:main"

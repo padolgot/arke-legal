@@ -1,5 +1,5 @@
 [project]
-name = "arke-legal"
+name = "arke"
 version = "0.1.382"
 description = "Local-first RAG for legal teams."
 requires-python = ">=3.12"
@@ -34,7 +34,7 @@ dev = [
 ]
 
 [project.urls]
-Repository = "https://github.com/padolgot/arke-legal"
+Repository = "https://github.com/padolgot/arke"
 
 [project.scripts]
 arke-server  = "arke.server.main:main"
