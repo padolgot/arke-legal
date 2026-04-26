@@ -1,11 +1,7 @@
-import hashlib
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 import numpy as np
-
-from . import sdb
 
 
 @dataclass
@@ -20,7 +16,8 @@ class Chunk:
     # to its document identity. Empty = no header (fallback for non-judgment docs).
     context_header: str = ""
 
-    # Runtime only — not serialized. Loaded from sdb.get_vec or computed on GPU.
+    # Runtime only — not serialized. Populated by the (caching) embedder
+    # at ingest time; cleared between server restarts.
     embedding: np.ndarray | None = field(default=None, compare=False, repr=False)
 
     def overlapped(self) -> str:
@@ -28,29 +25,12 @@ class Chunk:
 
     def baked(self) -> str:
         """Exact text the embedder consumes — overlapped chunk with the
-        contextual header prepended. cache_key keys off this so any change
-        to the recipe (header content, format) auto-invalidates the cache."""
+        contextual header prepended. The CachingEmbedder hashes this to
+        key its cache, so any change to the recipe (header content, format)
+        auto-invalidates the cache."""
         if self.context_header:
             return f"{self.context_header}\n\n{self.overlapped()}"
         return self.overlapped()
-
-    def cache_key(self, model_id: str, model_version: str) -> str:
-        # Strip path so a model relocated on disk doesn't invalidate the cache.
-        model_short = Path(model_id).name
-        raw = f"{model_short}:{model_version}:{self.baked()}"
-        return hashlib.md5(raw.encode()).hexdigest()
-
-    def save_embedding(self, model_id: str, model_version: str) -> None:
-        if self.embedding is None:
-            return
-        sdb.put_vec("embeddings", self.cache_key(model_id, model_version), self.embedding)
-
-    def load_embedding(self, model_id: str, model_version: str) -> bool:
-        vec = sdb.get_vec("embeddings", self.cache_key(model_id, model_version))
-        if vec is None:
-            return False
-        self.embedding = vec
-        return True
 
 
 @dataclass

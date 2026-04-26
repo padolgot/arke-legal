@@ -74,11 +74,12 @@ def run() -> None:
     digest_path = ws.path / "digest"
     docs: dict[str, Doc] = {}
     bm25 = BM25Index()
+    index = stress.ChunkIndex()
     last_digest_hash = ""
 
     if digest_path.exists():
         logger.info("loading digest on startup...")
-        last_digest_hash = _ingest(digest_path, cfg, models, docs, bm25)
+        last_digest_hash = _ingest(digest_path, cfg, models, docs, bm25, index)
 
     logger.info("arke ready [%s] — %d docs, %d chunks", ws.name, len(docs), _chunk_count(docs))
 
@@ -91,8 +92,8 @@ def run() -> None:
 
     try:
         while True:
-            _drain(docs, bm25, cfg, models)
-            last_digest_hash = _watch_digest(digest_path, last_digest_hash, cfg, models, docs, bm25)
+            _drain(docs, index, bm25, cfg, models)
+            last_digest_hash = _watch_digest(digest_path, last_digest_hash, cfg, models, docs, bm25, index)
             time.sleep(TICK)
     except KeyboardInterrupt:
         logger.info("shutting down")
@@ -108,7 +109,7 @@ def main() -> None:
 
 # --- ingest ------------------------------------------------------------------
 
-def _ingest(digest_path: Path, cfg: Config, models: Models, docs: dict[str, Doc], bm25: BM25Index) -> str:
+def _ingest(digest_path: Path, cfg: Config, models: Models, docs: dict[str, Doc], bm25: BM25Index, index: "stress.ChunkIndex") -> str:
     """case_name must exist BEFORE embedding so it can be prepended as a
     contextual header — without it, mid-judgment chunks have no anchor to
     the case identity.
@@ -121,7 +122,7 @@ def _ingest(digest_path: Path, cfg: Config, models: Models, docs: dict[str, Doc]
                  is the rclone-sync flow (SharePoint/OneDrive)."""
     docs.clear()
     bm25.clear()
-    model_key = cfg.embed_model_path or cfg.cloud_embed_model
+    index.clear()
 
     manifest_mode = (digest_path / "manifest.jsonl").exists()
     if manifest_mode:
@@ -160,18 +161,17 @@ def _ingest(digest_path: Path, cfg: Config, models: Models, docs: dict[str, Doc]
     # baked() (header + overlapped) — anchors mid-judgment chunks to case identity.
     # Embed in parallel — per-doc HTTP latency is the bottleneck (5-7s/call), and
     # OpenAI embed endpoints accept high concurrency. Workers tuned to stay under
-    # tier RPM/TPM limits; back off if 429s appear.
-    cached_total, embedded_total = _embed_all_parallel(docs, models.embedder, model_key)
+    # tier RPM/TPM limits; back off if 429s appear. Cache lives inside the
+    # embedder (CachingEmbedder) so repeated text is free across runs.
+    _embed_all_parallel(docs, models.embedder)
 
     for doc in docs.values():
         for chunk in doc.chunks:
             bm25.add(f"{doc.id}:{chunk.chunk_index}", chunk.overlapped())
 
     bm25.build()
-    logger.info(
-        "ingest done — %d docs, %d chunks (%d cached, %d embedded)",
-        len(docs), _chunk_count(docs), cached_total, embedded_total,
-    )
+    index.build(docs)
+    logger.info("ingest done — %d docs, %d chunks", len(docs), _chunk_count(docs))
 
     return _dir_hash(digest_path)
 
@@ -179,60 +179,47 @@ def _ingest(digest_path: Path, cfg: Config, models: Models, docs: dict[str, Doc]
 EMBED_WORKERS = 4
 
 
-def _embed_doc(doc: Doc, embedder, model_key: str) -> tuple[Doc, int, str | None]:
-    """Embed every uncached chunk in `doc` and persist.
-
-    Returns (doc, n_embedded, error). error is None on success, an error
-    string on failure — so one bad doc doesn't tear down the whole pool."""
-    missing_idx: list[int] = []
-    missing_texts: list[str] = []
-    for i, chunk in enumerate(doc.chunks):
-        if chunk.load_embedding(model_key, "1"):
-            continue
-        missing_idx.append(i)
-        missing_texts.append(chunk.baked())
-
-    if not missing_texts:
-        return doc, 0, None
+def _embed_doc(doc: Doc, embedder) -> tuple[Doc, str | None]:
+    """Embed every chunk in `doc` via the (caching) embedder. Returns
+    (doc, error). error is None on success, an error string on failure —
+    so one bad doc doesn't tear down the whole pool. Cache hits/misses
+    are handled transparently by CachingEmbedder."""
+    if not doc.chunks:
+        return doc, None
+    texts = [c.baked() for c in doc.chunks]
     try:
-        vecs = embedder.embed(missing_texts)
+        vecs = embedder.embed(texts)
     except Exception as e:
-        return doc, 0, f"{type(e).__name__}: {e}"
-    for idx, vec in zip(missing_idx, vecs):
-        doc.chunks[idx].embedding = np.array(vec, dtype=np.float32)
-        doc.chunks[idx].save_embedding(model_key, "1")
-    return doc, len(missing_texts), None
+        return doc, f"{type(e).__name__}: {e}"
+    for chunk, vec in zip(doc.chunks, vecs):
+        chunk.embedding = np.array(vec, dtype=np.float32)
+    return doc, None
 
 
-def _embed_all_parallel(docs: dict[str, Doc], embedder, model_key: str) -> tuple[int, int]:
-    """Parallel-embed all docs. Returns (cached_total, embedded_total).
+def _embed_all_parallel(docs: dict[str, Doc], embedder) -> int:
+    """Parallel-embed all docs. Returns failed count.
 
     Failed docs are logged and skipped — their chunks have no embedding and
     will not surface in cosine retrieval, but BM25 still indexes them."""
-    cached_total = 0
-    embedded_total = 0
     failed = 0
     total = len(docs)
     with ThreadPoolExecutor(max_workers=EMBED_WORKERS) as ex:
-        futures = {ex.submit(_embed_doc, doc, embedder, model_key): doc for doc in docs.values()}
+        futures = {ex.submit(_embed_doc, doc, embedder): doc for doc in docs.values()}
         for completed_idx, future in enumerate(as_completed(futures), 1):
-            doc, n_embedded, error = future.result()
+            doc, error = future.result()
             if error:
                 failed += 1
                 logger.warning("[%d/%d] %s — embed FAILED: %s", completed_idx, total, doc.label, error)
                 continue
-            n_cached = len(doc.chunks) - n_embedded
-            cached_total += n_cached
-            embedded_total += n_embedded
             ctx_yes = bool(doc.chunks and doc.chunks[0].context_header)
             logger.info(
-                "[%d/%d] %s — %d chunks (%d cached, %d embedded) ctx=%s",
-                completed_idx, total, doc.label, len(doc.chunks), n_cached, n_embedded,
+                "[%d/%d] %s — %d chunks ctx=%s",
+                completed_idx, total, doc.label, len(doc.chunks),
                 "yes" if ctx_yes else "no",
             )
     if failed:
         logger.warning("embed: %d/%d docs failed (skipped, no cosine for them)", failed, total)
-    return cached_total, embedded_total
+    return failed
 
 
 def _extract_case_name(doc: Doc, llm: LLM) -> str:
@@ -283,24 +270,24 @@ def _fill_case_names(docs: dict[str, Doc], llm: LLM) -> None:
 
 # --- main loop ---------------------------------------------------------------
 
-def _drain(docs: dict[str, Doc], bm25: BM25Index, cfg: Config, models: Models) -> None:
+def _drain(docs: dict[str, Doc], index: stress.ChunkIndex, bm25: BM25Index, cfg: Config, models: Models) -> None:
     for msg_id, request in mailbox.drain():
         try:
-            response = _dispatch(request, docs, bm25, cfg, models)
+            response = _dispatch(request, docs, index, bm25, cfg, models)
         except Exception as e:
             logger.warning("handler error: %s", e)
             response = {"ok": False, "error": str(e)}
         mailbox.reply(msg_id, response)
 
 
-def _dispatch(request: dict, docs: dict[str, Doc], bm25: BM25Index, cfg: Config, models: Models) -> dict:
+def _dispatch(request: dict, docs: dict[str, Doc], index: stress.ChunkIndex, bm25: BM25Index, cfg: Config, models: Models) -> dict:
     cmd = request.get("cmd")
 
     if cmd == "stress":
-        return stress.handle(request, docs, bm25, cfg, models)
+        return stress.handle(request, docs, index, bm25, cfg, models)
 
     if cmd == "search":
-        return _search(request, docs, bm25, cfg, models)
+        return _search(request, docs, index, bm25, cfg, models)
 
     if cmd == "ping":
         return {"ok": True, "pong": True}
@@ -334,14 +321,14 @@ def _citation_row(hit: SearchHit, docs: dict[str, Doc]) -> dict:
     return row
 
 
-def _search(request: dict, docs: dict[str, Doc], bm25: BM25Index, cfg: Config, models: Models) -> dict:
+def _search(request: dict, docs: dict[str, Doc], index: stress.ChunkIndex, bm25: BM25Index, cfg: Config, models: Models) -> dict:
     """Retrieval-only probe — no LLM. Powers eval/sweep AND the MCP/email
     consumer surface that needs rich citation metadata."""
     query = request.get("query", "")
     if not query:
         return {"ok": False, "error": "query is required"}
     q_vec = np.array(models.embedder.embed([query])[0], dtype=np.float32)
-    hits = stress.hybrid_search(docs, bm25, q_vec, query, cfg.k, cfg.alpha)
+    hits = stress.hybrid_search(index, bm25, q_vec, query, cfg.k, cfg.alpha)
     return {
         "ok": True,
         "citations": [_citation_row(h, docs) for h in hits],
@@ -355,6 +342,7 @@ def _watch_digest(
     models: Models,
     docs: dict[str, Doc],
     bm25: BM25Index,
+    index: stress.ChunkIndex,
 ) -> str:
     if not digest_path.exists():
         return last_hash
@@ -364,7 +352,7 @@ def _watch_digest(
         return last_hash
 
     logger.info("new digest detected, re-ingesting...")
-    return _ingest(digest_path, cfg, models, docs, bm25)
+    return _ingest(digest_path, cfg, models, docs, bm25, index)
 
 
 # --- helpers -----------------------------------------------------------------
