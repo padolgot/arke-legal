@@ -27,8 +27,8 @@ class Config:
     embedding_dim: int = 0
     chunk_size: int = 600
     overlap: float = 0.0
-    alpha: float = 0.7
-    k: int = 5
+    alpha: float = 1.0
+    k: int = 10
 
     def resolved(self) -> Config:
         if self.backend == "local":
@@ -70,8 +70,8 @@ class Config:
             embedding_dim=int(os.environ.get("EMBEDDING_DIM", "0")),
             chunk_size=int(os.environ.get("CHUNK_SIZE", "600")),
             overlap=float(os.environ.get("OVERLAP", "0.0")),
-            alpha=float(os.environ.get("ALPHA", "0.7")),
-            k=int(os.environ.get("K", "5")),
+            alpha=float(os.environ.get("ALPHA", "1.0")),
+            k=int(os.environ.get("K", "10")),
         )
 
 

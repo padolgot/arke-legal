@@ -323,15 +323,30 @@ def _citation_row(hit: SearchHit, docs: dict[str, Doc]) -> dict:
 
 def _search(request: dict, docs: dict[str, Doc], index: stress.ChunkIndex, bm25: BM25Index, cfg: Config, models: Models) -> dict:
     """Retrieval-only probe — no LLM. Powers eval/sweep AND the MCP/email
-    consumer surface that needs rich citation metadata."""
+    consumer surface that needs rich citation metadata.
+
+    Returns top-K UNIQUE docs (best-scoring chunk per doc). Fetches a wide
+    candidate pool first because lexically-dense docs otherwise dominate
+    the chunk-level top-K with multiple chunks of the same authority."""
     query = request.get("query", "")
     if not query:
         return {"ok": False, "error": "query is required"}
     q_vec = np.array(models.embedder.embed([query])[0], dtype=np.float32)
-    hits = stress.hybrid_search(index, bm25, q_vec, query, cfg.k, cfg.alpha)
+    hits = stress.hybrid_search(index, bm25, q_vec, query, cfg.k * 8, cfg.alpha)
+
+    seen_docs: set[str] = set()
+    unique: list[stress.SearchHit] = []
+    for h in hits:
+        if h.chunk.doc_id in seen_docs:
+            continue
+        seen_docs.add(h.chunk.doc_id)
+        unique.append(h)
+        if len(unique) >= cfg.k:
+            break
+
     return {
         "ok": True,
-        "citations": [_citation_row(h, docs) for h in hits],
+        "citations": [_citation_row(h, docs) for h in unique],
     }
 
 
