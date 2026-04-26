@@ -1,4 +1,4 @@
-# Arke
+# 🏺 Arke
 
 **Devil's advocate over your own data. Privately. Via email.**
 
@@ -65,7 +65,7 @@ All via environment variables (`.env`):
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ARKE_WORKSPACE` | `default` | Workspace name (isolates documents per client) |
+| `ARKE_WORKSPACE` | `default` | Workspace name |
 | `CHUNK_SIZE` | `600` | Characters per chunk |
 | `OVERLAP` | `0.0` | Overlap fraction (0–0.5) |
 | `ALPHA` | `0.7` | Blend: 1.0 = pure semantic, 0.0 = pure keyword |

@@ -42,7 +42,7 @@ BLOCKQUOTE_STYLE = "margin:6px 0;padding:4px 12px;border-left:3px solid #bbb"
 SOURCE_LINE_STYLE = "margin:2px 0 14px 0;font-size:10pt;color:#888;font-style:italic;text-align:left"
 FOOTER_STYLE = "margin:28px 0 0 0;padding-top:12px;border-top:1px solid #eee;font-size:9.5pt;color:#888"
 
-FOOTER_HTML = "This is a public demo of Arke on UK case law (BAILII)."
+FOOTER_HTML = "🏺 Arke — public demo on UK & EU competition law"
 
 
 @dataclass(frozen=True)

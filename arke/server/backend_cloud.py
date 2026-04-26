@@ -1,6 +1,7 @@
 """Cloud backend — OpenAI API via HTTP."""
 import json
 import logging
+import random
 import time
 import urllib.error
 import urllib.request
@@ -82,7 +83,9 @@ def _post(base_url: str, api_key: str, path: str, body: dict) -> dict:
             if not retriable or last_attempt:
                 raise
             retry_after = e.headers.get("Retry-After") if e.headers else None
-            wait = float(retry_after) if retry_after and retry_after.replace(".", "").isdigit() else delay
+            base = float(retry_after) if retry_after and retry_after.replace(".", "").isdigit() else delay
+            # Jitter prevents thundering-herd retries from concurrent workers.
+            wait = base + random.uniform(0, 1.5)
             logger.warning("cloud %s %d — retry in %.1fs (attempt %d/%d)", path, e.code, wait, attempt + 1, RETRY_ATTEMPTS)
             time.sleep(wait)
             delay *= 2

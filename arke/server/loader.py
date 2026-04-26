@@ -1,9 +1,16 @@
 """Loader — turns raw files from digest/ into (Doc, text) pairs.
 
+Two discovery modes:
+  load_digest  — generic file walk by extension; used for rclone'd SharePoint/
+                 OneDrive corpora where there's no schema.
+  load_corpus  — manifest.jsonl-driven; used for prepared static corpora that
+                 ship rich metadata (canonical_id, citation graph, etc.).
+
 Dispatcher uses file extension. Supported: .txt .md .pdf .docx .msg
 Unsupported files are skipped silently — unknown formats are normal in digest/.
 """
 import hashlib
+import json
 import logging
 from pathlib import Path
 
@@ -21,6 +28,39 @@ def load_digest(digest_path: Path) -> list[tuple[Doc, str]]:
         result = load_file(path, root=digest_path)
         if result is not None:
             results.append(result)
+    return results
+
+
+def load_corpus(corpus_path: Path) -> list[tuple[Doc, str]]:
+    """Manifest-driven discovery. Reads manifest.jsonl at corpus_path root,
+    loads each row's text file, returns (Doc, text) with full manifest metadata.
+
+    Doc.id = manifest['doc_id'] — stable across re-ingests and matchable to
+    citation_graph edges. `title` is mirrored into metadata['case_name'] so
+    the chunk context_header pipeline works without an LLM extraction pass."""
+    manifest_path = corpus_path / "manifest.jsonl"
+    results: list[tuple[Doc, str]] = []
+    for line in manifest_path.read_text().splitlines():
+        if not line.strip():
+            continue
+        rec = json.loads(line)
+        text_path = corpus_path / rec["corpus_path"]
+        text = text_path.read_text(encoding="utf-8", errors="replace").strip()
+        if not text:
+            continue
+        stat = text_path.stat()
+        meta = dict(rec)
+        meta["filename"] = text_path.name
+        meta["suffix"] = text_path.suffix.lower()
+        meta["case_name"] = rec.get("title", "")
+        doc = Doc(
+            id=rec["doc_id"],
+            source=rec["corpus_path"],
+            created=int(stat.st_ctime),
+            modified=int(stat.st_mtime),
+            metadata=meta,
+        )
+        results.append((doc, text))
     return results
 
 

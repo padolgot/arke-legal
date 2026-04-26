@@ -24,7 +24,7 @@ from .bm25 import BM25Index
 from .config import Config
 from .models import LLM, Models
 from .workspace import mount as mount_workspace
-from .types import Chunk, Doc
+from .types import Chunk, Doc, SearchHit
 
 CASE_NAME_TABLE = "case_names"
 CASE_NAME_EXTRACT_CHARS = 2000
@@ -111,21 +111,35 @@ def main() -> None:
 def _ingest(digest_path: Path, cfg: Config, models: Models, docs: dict[str, Doc], bm25: BM25Index) -> str:
     """case_name must exist BEFORE embedding so it can be prepended as a
     contextual header — without it, mid-judgment chunks have no anchor to
-    the case identity."""
+    the case identity.
+
+    Two ingest modes, auto-detected:
+      manifest — `manifest.jsonl` present in digest_path. Discovery and metadata
+                 come from it; doc_id matches the citation graph; LLM case_name
+                 extraction is skipped (we already have `title`).
+      walk     — no manifest. Generic rglob by extension + LLM case_name. This
+                 is the rclone-sync flow (SharePoint/OneDrive)."""
     docs.clear()
     bm25.clear()
     model_key = cfg.embed_model_path or cfg.cloud_embed_model
 
-    files = [p for p in sorted(digest_path.rglob("*")) if p.is_file() and not p.name.startswith(".")]
-    total_files = len(files)
-    logger.info("ingest start — %d files under %s", total_files, digest_path)
+    manifest_mode = (digest_path / "manifest.jsonl").exists()
+    if manifest_mode:
+        pairs = loader.load_corpus(digest_path)
+        logger.info("ingest start (manifest) — %d docs under %s", len(pairs), digest_path)
+    else:
+        files = [p for p in sorted(digest_path.rglob("*")) if p.is_file() and not p.name.startswith(".")]
+        total_files = len(files)
+        logger.info("ingest start (walk) — %d files under %s", total_files, digest_path)
+        pairs = []
+        for file_idx, path in enumerate(files, 1):
+            result = loader.load_file(path, root=digest_path)
+            if result is None:
+                logger.info("[%d/%d] skipped (unsupported): %s", file_idx, total_files, path.name)
+                continue
+            pairs.append(result)
 
-    for file_idx, path in enumerate(files, 1):
-        result = loader.load_file(path, root=digest_path)
-        if result is None:
-            logger.info("[%d/%d] skipped (unsupported): %s", file_idx, total_files, path.name)
-            continue
-        doc, text = result
+    for doc, text in pairs:
         chunk_datas = chunker.chunk(text, cfg.chunk_size, cfg.overlap)
         for i, cd in enumerate(chunk_datas):
             doc.chunks.append(
@@ -133,7 +147,8 @@ def _ingest(digest_path: Path, cfg: Config, models: Models, docs: dict[str, Doc]
             )
         docs[doc.id] = doc
 
-    _fill_case_names(docs, models.llm)
+    if not manifest_mode:
+        _fill_case_names(docs, models.llm)
     for doc in docs.values():
         case_name = doc.metadata.get("case_name", "") or ""
         if not case_name:
@@ -141,38 +156,16 @@ def _ingest(digest_path: Path, cfg: Config, models: Models, docs: dict[str, Doc]
         for chunk in doc.chunks:
             chunk.context_header = case_name
 
-    cached_total = 0
-    embedded_total = 0
     # BM25 sees overlapped() (no header) — keeps IDF clean. Embedder sees
     # baked() (header + overlapped) — anchors mid-judgment chunks to case identity.
-    for file_idx, doc in enumerate(docs.values(), 1):
-        missing_idx: list[int] = []
-        missing_texts: list[str] = []
-        for i, chunk in enumerate(doc.chunks):
-            if chunk.load_embedding(model_key, "1"):
-                continue
-            missing_idx.append(i)
-            missing_texts.append(chunk.baked())
+    # Embed in parallel — per-doc HTTP latency is the bottleneck (5-7s/call), and
+    # OpenAI embed endpoints accept high concurrency. Workers tuned to stay under
+    # tier RPM/TPM limits; back off if 429s appear.
+    cached_total, embedded_total = _embed_all_parallel(docs, models.embedder, model_key)
 
-        if missing_texts:
-            vecs = models.embedder.embed(missing_texts)
-            for idx, vec in zip(missing_idx, vecs):
-                doc.chunks[idx].embedding = np.array(vec, dtype=np.float32)
-                doc.chunks[idx].save_embedding(model_key, "1")
-
-        cached = len(doc.chunks) - len(missing_texts)
-        embedded = len(missing_texts)
-        cached_total += cached
-        embedded_total += embedded
-
+    for doc in docs.values():
         for chunk in doc.chunks:
             bm25.add(f"{doc.id}:{chunk.chunk_index}", chunk.overlapped())
-
-        logger.info(
-            "[%d/%d] %s — %d chunks (%d cached, %d embedded) ctx=%s",
-            file_idx, len(docs), doc.label, len(doc.chunks), cached, embedded,
-            "yes" if doc.chunks and doc.chunks[0].context_header else "no",
-        )
 
     bm25.build()
     logger.info(
@@ -181,6 +174,65 @@ def _ingest(digest_path: Path, cfg: Config, models: Models, docs: dict[str, Doc]
     )
 
     return _dir_hash(digest_path)
+
+
+EMBED_WORKERS = 4
+
+
+def _embed_doc(doc: Doc, embedder, model_key: str) -> tuple[Doc, int, str | None]:
+    """Embed every uncached chunk in `doc` and persist.
+
+    Returns (doc, n_embedded, error). error is None on success, an error
+    string on failure — so one bad doc doesn't tear down the whole pool."""
+    missing_idx: list[int] = []
+    missing_texts: list[str] = []
+    for i, chunk in enumerate(doc.chunks):
+        if chunk.load_embedding(model_key, "1"):
+            continue
+        missing_idx.append(i)
+        missing_texts.append(chunk.baked())
+
+    if not missing_texts:
+        return doc, 0, None
+    try:
+        vecs = embedder.embed(missing_texts)
+    except Exception as e:
+        return doc, 0, f"{type(e).__name__}: {e}"
+    for idx, vec in zip(missing_idx, vecs):
+        doc.chunks[idx].embedding = np.array(vec, dtype=np.float32)
+        doc.chunks[idx].save_embedding(model_key, "1")
+    return doc, len(missing_texts), None
+
+
+def _embed_all_parallel(docs: dict[str, Doc], embedder, model_key: str) -> tuple[int, int]:
+    """Parallel-embed all docs. Returns (cached_total, embedded_total).
+
+    Failed docs are logged and skipped — their chunks have no embedding and
+    will not surface in cosine retrieval, but BM25 still indexes them."""
+    cached_total = 0
+    embedded_total = 0
+    failed = 0
+    total = len(docs)
+    with ThreadPoolExecutor(max_workers=EMBED_WORKERS) as ex:
+        futures = {ex.submit(_embed_doc, doc, embedder, model_key): doc for doc in docs.values()}
+        for completed_idx, future in enumerate(as_completed(futures), 1):
+            doc, n_embedded, error = future.result()
+            if error:
+                failed += 1
+                logger.warning("[%d/%d] %s — embed FAILED: %s", completed_idx, total, doc.label, error)
+                continue
+            n_cached = len(doc.chunks) - n_embedded
+            cached_total += n_cached
+            embedded_total += n_embedded
+            ctx_yes = bool(doc.chunks and doc.chunks[0].context_header)
+            logger.info(
+                "[%d/%d] %s — %d chunks (%d cached, %d embedded) ctx=%s",
+                completed_idx, total, doc.label, len(doc.chunks), n_cached, n_embedded,
+                "yes" if ctx_yes else "no",
+            )
+    if failed:
+        logger.warning("embed: %d/%d docs failed (skipped, no cosine for them)", failed, total)
+    return cached_total, embedded_total
 
 
 def _extract_case_name(doc: Doc, llm: LLM) -> str:
@@ -256,9 +308,35 @@ def _dispatch(request: dict, docs: dict[str, Doc], bm25: BM25Index, cfg: Config,
     return {"ok": False, "error": f"unknown cmd: {cmd}"}
 
 
+_CITATION_FIELDS = (
+    "canonical_id", "neutral_citation", "celex", "ecli", "party_slug",
+    "title", "court", "date", "doc_type", "category", "cite_in_count",
+    "url", "source",
+)
+
+
+def _citation_row(hit: SearchHit, docs: dict[str, Doc]) -> dict:
+    """Shape one search hit for an LLM/MCP consumer. Manifest-mode docs
+    surface rich fields (citation IDs, court, date, weight); walk-mode docs
+    surface only the minimum (doc_id + chunk + snippet)."""
+    doc = docs.get(hit.chunk.doc_id)
+    meta = doc.metadata if doc else {}
+    row = {
+        "doc_id": hit.chunk.doc_id,
+        "chunk_index": hit.chunk.chunk_index,
+        "score": round(hit.similarity, 3),
+        "snippet": hit.chunk.clean,
+    }
+    for field in _CITATION_FIELDS:
+        value = meta.get(field)
+        if value:
+            row[field] = value
+    return row
+
+
 def _search(request: dict, docs: dict[str, Doc], bm25: BM25Index, cfg: Config, models: Models) -> dict:
-    """Retrieval-only probe — no LLM. Used by eval/sweep to measure recall@k
-    cheaply across many configs. Not exposed to clients."""
+    """Retrieval-only probe — no LLM. Powers eval/sweep AND the MCP/email
+    consumer surface that needs rich citation metadata."""
     query = request.get("query", "")
     if not query:
         return {"ok": False, "error": "query is required"}
@@ -266,10 +344,7 @@ def _search(request: dict, docs: dict[str, Doc], bm25: BM25Index, cfg: Config, m
     hits = stress.hybrid_search(docs, bm25, q_vec, query, cfg.k, cfg.alpha)
     return {
         "ok": True,
-        "citations": [
-            {"doc_id": h.chunk.doc_id, "chunk_index": h.chunk.chunk_index, "score": round(h.similarity, 3)}
-            for h in hits
-        ],
+        "citations": [_citation_row(h, docs) for h in hits],
     }
 
 
