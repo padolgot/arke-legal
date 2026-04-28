@@ -4,14 +4,14 @@ Pipeline:
   1. hybrid retrieval on the argument
   2. cheap gate on top similarity (drop if corpus is off-topic)
   3. per-doc LLM filter — adversarial chunk selection (parallel across docs)
-  4. mosaic LLM — cluster passages into SUPPORTS/ATTACKS authorities with labels
+  4. mosaic LLM — cluster passages into adversarial authorities with labels
   5. trimmer LLM — strip procedural narrative, preserving verbatim ratio
 """
 import json
 import logging
+import math
 import re
 from concurrent.futures import ThreadPoolExecutor
-from itertools import zip_longest
 
 import numpy as np
 
@@ -22,92 +22,68 @@ from .types import Chunk, Doc, SearchHit
 
 logger = logging.getLogger(__name__)
 
-PER_DOC_PROMPT = (
-    "You analyse one document from a litigator's case archive. Identify chunks "
-    "that form an adversarial mosaic against the lawyer's argument — the parts "
-    "that would weaken, limit, or contradict it. Be generous: include any "
-    "chunk that even partially supports an adversarial reading. A separate "
-    "pass will refine the selection later.\n"
-    "\n"
-    "Return ONLY a JSON array of chunk indices, e.g. [3, 7, 14, 22].\n"
-    "\n"
-    "Rules:\n"
-    "- Range 5-25 indices when the document has adversarial content.\n"
-    "- Return [] if the document contains nothing adversarial.\n"
-    "- Do not explain. Output only the JSON array."
-)
+from .prompts import MOSAIC_SYSTEM_PROMPT, PER_DOC_PROMPT, TRIMMER_SYSTEM_PROMPT
 
-MOSAIC_SYSTEM_PROMPT = (
-    "You are counsel stress-testing a lawyer's position. From passages in "
-    "their archive, identify cases that bear on the argument. For each case, "
-    "classify whether the authority SUPPORTS the lawyer's position or CUTS "
-    "AGAINST it, and write the specific legal proposition the passages prove.\n"
-    "\n"
-    "Output STRICTLY a JSON array:\n"
-    '[{"stance": "SUPPORTS"|"ATTACKS", "label": "proposition phrase", "passages": [1, 4]}, ...]\n'
-    "\n"
-    "Each cluster is ONE document (one authority) making ONE point. All "
-    "passages in a cluster must come from the same source document.\n"
-    "\n"
-    "stance — your honest judgement of valence:\n"
-    "  SUPPORTS: the authority reinforces the lawyer's position\n"
-    "  ATTACKS: the authority weakens or contradicts the lawyer's position\n"
-    "Both are valuable — partners need contrast (gas + brake).\n"
-    "\n"
-    "label — tight legal proposition the passages establish. 3-8 words. "
-    "Specific to the argument. Doctrinal language, not a case name.\n"
-    "  SUPPORTS examples:\n"
-    "    'No duty to public purchasers of shares'\n"
-    "    'Disclaimer effective to exclude responsibility'\n"
-    "    'Proximity absent where no direct dealings'\n"
-    "  ATTACKS examples:\n"
-    "    'Duty found where reliance was specific and known'\n"
-    "    'Assumption of responsibility implied despite disclaimer'\n"
-    "    'Indeterminate class does not bar duty'\n"
-    "  Bad for either stance:\n"
-    "    'Caparo precedent'        (just names case)\n"
-    "    'Duty of care limits'     (too generic)\n"
-    "\n"
-    "Rules:\n"
-    "- passages: 1-indexed passage numbers. 1-3 per cluster.\n"
-    "- 3-5 clusters total, each from a DIFFERENT source document.\n"
-    "- Mix SUPPORTS and ATTACKS naturally based on what the corpus contains — "
-    "don't force one side.\n"
-    "- Skip passages off-topic to the argument.\n"
-    "- If corpus contains nothing on-topic, output [].\n"
-    "- Output ONLY the JSON array."
-)
-
-TRIMMER_SYSTEM_PROMPT = (
-    "You receive a mosaic of case-law excerpts chosen as adversarial authority. "
-    "Your job is to trim procedural narrative, lead-in, and background from "
-    "within each quoted passage, leaving only the operative legal substance — "
-    "the ratio, the holding, the doctrinal statement.\n"
-    "\n"
-    "Rules:\n"
-    "- Within each blockquote, DELETE procedural text (recitations of claim "
-    "paragraphs, statement-of-claim references, background facts, procedural "
-    "history) and REPLACE the deleted span with '[…]' (bracket-ellipsis).\n"
-    "- NEVER remove a blockquote entirely.\n"
-    "- NEVER rewrite, paraphrase, or add new words. The ONLY new text you "
-    "may introduce is '[…]'. Every remaining word must appear verbatim in "
-    "the input.\n"
-    "- Preserve the structure exactly: ## headers (including [SUPPORTS]/[ATTACKS] "
-    "tags and middle-dot separators), > blockquotes, — source lines.\n"
-    "- If a passage is already lean (mostly ratio / holding), leave it as-is.\n"
-    "\n"
-    "Output the trimmed markdown. No preamble, no explanation."
-)
-
-MAX_DOCS = 10
+TOP_DOCS_BUFFER = 14
+TOP_DOCS_FIT = 10
 DOC_MAX_TOKENS = 50000
 RETRIEVAL_K = 40
 MAX_WORKERS = 3
 MAX_PASSAGES_PER_DOC = 6
 MAX_CHUNKS_PER_PASSAGE = 2
+# Uncalibrated. Picked from the sky early in development. Functionally a
+# no-op so far — top similarity in real tests sits at 0.6-0.7. Calibrate
+# against eval_cases_sample_50.jsonl when retrieval quality becomes the
+# bottleneck.
 GATE = 0.3
+# Multiplicative log-boost on retrieval ranking: foundational authorities
+# (heavily cited inside the corpus) outrank lexically-similar but never-cited
+# docs. score = cosine * (1 + α · log(1 + cite_in_count)). α=0.5 → cite_in=12
+# yields ~2.28× boost; cite_in=100 → ~3.30×; cite_in=0 stays at 1.0×. Keeps
+# uncited alpha-layer reachable, avoids "crush" of long-tail docs.
+CITE_BOOST_ALPHA = 0.5
 
 INSUFFICIENT_MSG = "Insufficient on-topic material in the corpus. Add more documents and try again."
+NO_ADVERSARIAL_MSG = (
+    "Arke surfaced no adversarial authority on this argument. Either the "
+    "position is on-doctrine, or the corpus lacks contestable counter-authority "
+    "on this point."
+)
+
+
+def _clean_title(title: str) -> str:
+    """Clean EU CELLAR titles which use '.#'-separated metadata segments.
+    Pick the first segment that reads as 'X v Y'; else fall back to the
+    first non-empty segment. UK titles pass through unchanged."""
+    if ".#" not in title:
+        return title.strip()
+    parts = [p.strip() for p in title.split(".#") if p.strip()]
+    for p in parts:
+        low = f" {p.lower()} "
+        if " v " in low or " v. " in low:
+            return p
+    return parts[0] if parts else title
+
+
+def _footer_line(p: dict) -> str:
+    """Build the per-cluster footer: corpus_path | [citation] | title | cited N× · date"""
+    bits: list[str] = [p["corpus_path"] or p["filename"]]
+    citation = p.get("citation", "")
+    if citation:
+        bits.append(citation if citation.startswith("[") else f"[{citation}]")
+    title = _clean_title(p.get("case_name") or "")
+    if title:
+        bits.append(title)
+    tail: list[str] = []
+    cic = p.get("cite_in_count") or 0
+    if cic:
+        tail.append(f"cited {cic}×")
+    if p.get("date"):
+        tail.append(p["date"])
+    line = " | ".join(bits)
+    if tail:
+        line += " | " + " · ".join(tail)
+    return f"— {line}"
 
 
 def handle(
@@ -137,17 +113,27 @@ def handle(
         did = h.chunk.doc_id
         if did not in by_doc or h.similarity > by_doc[did]:
             by_doc[did] = h.similarity
-    top_doc_ids = sorted(by_doc, key=lambda d: by_doc[d], reverse=True)[:MAX_DOCS]
+
+    def _doc_rank(doc_id: str) -> float:
+        cite_in = docs[doc_id].metadata.get("cite_in_count", 0) or 0
+        return by_doc[doc_id] * (1 + CITE_BOOST_ALPHA * math.log(1 + cite_in))
+
+    top_doc_ids = sorted(by_doc, key=_doc_rank, reverse=True)[:TOP_DOCS_BUFFER]
     logger.info("stress-test: %d candidate docs from %d chunks", len(top_doc_ids), len(hits))
 
     fit_docs: list[Doc] = []
     for doc_id in top_doc_ids:
+        if len(fit_docs) >= TOP_DOCS_FIT:
+            break
         doc = docs[doc_id]
-        # ~4 chars per token is a rough but stable estimator; LLMs handle up
-        # to ~50k cleanly, beyond that we'd hit context-window risk.
+        # ~4 chars per token is a rough but stable estimator. Dirty hack —
+        # Pasha-approved while we sit on OpenAI Tier 1 TPM: some judgments
+        # run 100-200k tokens and would blow per-doc-filter's context budget.
+        # The TOP_DOCS_BUFFER above oversamples so this drop still leaves
+        # ~TOP_DOCS_FIT survivors. Lift the cap when the tier upgrades.
         est_tokens = sum(len(c.clean) for c in doc.chunks) // 4
         if est_tokens > DOC_MAX_TOKENS:
-            logger.info("stress-test: skip %s (%dk tokens)", doc.label, est_tokens // 1000)
+            logger.info("stress-test: skip %s (%dk tokens, TPM hack)", doc.label, est_tokens // 1000)
             continue
         fit_docs.append(doc)
 
@@ -161,82 +147,107 @@ def handle(
             logger.info("stress-test: %s → %d/%d chunks", doc.label, len(indices), len(doc.chunks))
 
     if not mosaics:
-        return {"ok": True, "answer": "", "citations": []}
+        return {"ok": True, "answer": NO_ADVERSARIAL_MSG, "citations": []}
 
-    per_doc: list[list[dict]] = []
+    # Build per-doc passages with rich metadata. Each doc keeps its own
+    # passage list — single-source preserved structurally through the rest
+    # of the pipeline (no flat pool, no round-robin, no cross-doc merging).
+    doc_passages: dict[str, list[dict]] = {}
     for doc_id, chunks in mosaics.items():
         doc = docs[doc_id]
-        case_name = doc.metadata.get("case_name", "") or ""
-        doc_passages = [
-            {"doc_id": doc.id, "filename": doc.label, "case_name": case_name, "text": text}
+        meta = doc.metadata
+        passages = [
+            {
+                "doc_id": doc.id,
+                "filename": doc.label,
+                "case_name": meta.get("title") or meta.get("case_name") or "",
+                "corpus_path": meta.get("corpus_path", "") or doc.source or doc.label,
+                "citation": (
+                    meta.get("neutral_citation")
+                    or meta.get("celex")
+                    or meta.get("ecli")
+                    or ""
+                ),
+                "date": meta.get("date", "") or "",
+                "cite_in_count": meta.get("cite_in_count", 0) or 0,
+                "text": text,
+            }
             for text in _merge_adjacent(chunks)[:MAX_PASSAGES_PER_DOC]
         ]
-        if doc_passages:
-            per_doc.append(doc_passages)
+        if passages:
+            doc_passages[doc.id] = passages
 
-    # Round-robin so the first slots in the mosaic LLM context span all docs —
-    # otherwise a single rich doc dominates and rivals get truncated.
-    passages: list[dict] = [
-        p for group in zip_longest(*per_doc) for p in group if p is not None
-    ]
+    if not doc_passages:
+        return {"ok": True, "answer": NO_ADVERSARIAL_MSG, "citations": []}
 
-    def _p_label(p: dict) -> str:
-        return f"{p['case_name']} ({p['filename']})" if p["case_name"] else p["filename"]
+    # Curate: strong LLM sees ALL docs at once, drops noise/duplicates/
+    # off-key passages, and writes one ensemble label per surviving doc.
+    # Single-source structurally enforced by the per-doc input/output schema.
+    key_to_doc: dict[str, str] = {}
+    curate_input: dict[str, list[str]] = {}
+    for i, doc_id in enumerate(doc_passages, start=1):
+        key = f"doc_{i}"
+        key_to_doc[key] = doc_id
+        curate_input[key] = [p["text"] for p in doc_passages[doc_id]]
 
-    context = "\n\n".join(
-        f"[{i+1}] (source: {_p_label(p)}) {p['text']}" for i, p in enumerate(passages)
+    context_lines = []
+    for key, did in key_to_doc.items():
+        first = doc_passages[did][0]
+        ident = f"{first['case_name']}".strip()
+        if first["citation"]:
+            ident = f"{ident} ({first['citation']})" if ident else first["citation"]
+        context_lines.append(f"- {key}: {ident or first['filename']}")
+
+    user_msg = (
+        f"Argument:\n{argument}\n\n"
+        "Doc context (case identity for label-writing):\n"
+        + "\n".join(context_lines)
+        + "\n\n"
+        "Candidate passages by document — curate (drop, never reorder, never "
+        "merge across docs) and label each surviving doc. Output JSON:\n"
+        + json.dumps(curate_input, ensure_ascii=False, indent=2)
     )
-    user_msg = f"Argument:\n{argument}\n\nPassages:\n{context}"
     raw = models.strong_llm.chat(MOSAIC_SYSTEM_PROMPT, user_msg)
-    all_clusters = _parse_clusters(raw, len(passages))
-
-    # Drop multi-source clusters (LLM occasionally merges across docs) and
-    # keep only the first cluster per source doc — one authority, one point.
-    seen_docs: set[str] = set()
-    clusters: list[dict] = []
-    for c in all_clusters:
-        cluster_docs = {passages[p - 1]["doc_id"] for p in c["passages"]}
-        if len(cluster_docs) != 1:
-            continue
-        doc_id = next(iter(cluster_docs))
-        if doc_id in seen_docs:
-            continue
-        seen_docs.add(doc_id)
-        clusters.append(c)
+    curated = _parse_curate(raw, curate_input)
     logger.info(
-        "stress-test: LLM returned %d clusters → %d after single-source / unique-doc filter",
-        len(all_clusters), len(clusters),
+        "stress-test: curate — kept %d/%d docs",
+        len(curated), len(curate_input),
     )
 
-    if not clusters:
-        return {"ok": True, "answer": "", "citations": []}
+    if not curated:
+        logger.info("stress-test: raw curate output (kept 0):\n%s", raw[:2000])
+        return {"ok": True, "answer": NO_ADVERSARIAL_MSG, "citations": []}
 
     parts: list[str] = []
     used: list[dict] = []
-    for cluster in clusters:
-        first = passages[cluster["passages"][0] - 1]
-        case_name = first["case_name"]
-        stance = cluster["stance"]
-        label = cluster["label"]
-        header = f"[{stance}] {case_name} · {label}" if case_name else f"[{stance}] {label}"
-        parts.append(f"## {header}")
-        for p_num in cluster["passages"]:
-            passage = passages[p_num - 1]
+    for key, decision in curated.items():
+        doc_id = key_to_doc[key]
+        passages = doc_passages[doc_id]
+        keep = [i for i in decision["keep"] if 0 <= i < len(passages)]
+        if not keep:
+            continue
+        parts.append(f"## {decision['label']}")
+        for i in keep:
+            passage = passages[i]
             parts.append(f"> {passage['text']}")
             used.append(passage)
-        parts.append(f"— {first['filename']}")
+        parts.append(_footer_line(passages[keep[0]]))
+        logger.info(
+            "  %s (%s): keep=%s label=%r",
+            key,
+            (passages[0]["case_name"] or "(no name)")[:60],
+            keep,
+            decision["label"],
+        )
+
+    if not parts:
+        return {"ok": True, "answer": NO_ADVERSARIAL_MSG, "citations": []}
 
     raw_answer = "\n\n".join(parts)
     logger.info(
-        "stress-test: mosaic — %d clusters, %d/%d passages, raw=%dchars",
-        len(clusters), len(used), len(passages), len(raw_answer),
+        "stress-test: mosaic — %d clusters, %d passages, raw=%d chars",
+        len(curated), len(used), len(raw_answer),
     )
-    for i, cluster in enumerate(clusters, 1):
-        first = passages[cluster["passages"][0] - 1]
-        logger.info("  cluster %d: [%s] %r case=%r file=%s n_passages=%d",
-                    i, cluster["stance"], cluster["label"],
-                    first["case_name"] or "(none)",
-                    first["filename"], len(cluster["passages"]))
 
     answer = models.llm.chat(TRIMMER_SYSTEM_PROMPT, raw_answer).strip()
     reduction = (1 - len(answer) / max(len(raw_answer), 1)) * 100
@@ -370,28 +381,30 @@ def hybrid_search(
     return hits
 
 
-def _parse_clusters(raw: str, passage_count: int) -> list[dict]:
-    """Parse LLM JSON output into validated clusters: [{stance, label, passages}]."""
-    match = re.search(r"\[.*\]", raw, re.DOTALL)
+def _parse_curate(raw: str, curate_input: dict[str, list[str]]) -> dict[str, dict]:
+    """Parse strong-LLM curation output: {doc_key: {keep: [int], label: str}}.
+    Validates keys against curate_input, indices against per-doc passage
+    count. Returns only well-formed doc entries; preserves LLM ordering."""
+    match = re.search(r"\{.*\}", raw, re.DOTALL)
     if not match:
-        return []
+        return {}
     try:
         data = json.loads(match.group(0))
     except (json.JSONDecodeError, ValueError):
-        return []
-    clusters: list[dict] = []
-    for item in data:
-        if not isinstance(item, dict):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, dict] = {}
+    for key, val in data.items():
+        if key not in curate_input or not isinstance(val, dict):
             continue
-        label = item.get("label")
-        passages = item.get("passages")
-        stance = str(item.get("stance", "ATTACKS")).upper().strip()
-        if stance not in ("SUPPORTS", "ATTACKS"):
-            stance = "ATTACKS"
-        if not isinstance(label, str) or not isinstance(passages, list):
+        keep = val.get("keep")
+        label = val.get("label")
+        if not isinstance(keep, list) or not isinstance(label, str):
             continue
-        valid = [p for p in passages if isinstance(p, int) and 1 <= p <= passage_count]
+        n = len(curate_input[key])
+        valid_keep = [i for i in keep if isinstance(i, int) and 0 <= i < n]
         label_clean = label.strip().rstrip(".").strip()
-        if label_clean and valid:
-            clusters.append({"stance": stance, "label": label_clean, "passages": valid})
-    return clusters
+        if valid_keep and label_clean:
+            out[key] = {"keep": valid_keep, "label": label_clean}
+    return out

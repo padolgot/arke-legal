@@ -15,7 +15,7 @@ class Embedder(Protocol):
 
 
 class LLM(Protocol):
-    def chat(self, system: str | None, user: str) -> str: ...
+    def chat(self, system: str | None, user: str, temperature: float = 0.0) -> str: ...
 
 
 EMBED_CACHE_TABLE = "embeddings"

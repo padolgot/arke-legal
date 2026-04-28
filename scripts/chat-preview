@@ -1,0 +1,36 @@
+#!/usr/bin/env python3
+"""Compressed view of arke chat.log — header + first 200 chars of Q and A."""
+import re
+from pathlib import Path
+
+LOG = Path.home() / ".arke" / "workspaces" / "comp" / "chat.log"
+SEP = re.compile(r"={70,}\n")
+LIMIT = 200
+
+
+def trim(s: str) -> str:
+    s = s.strip().replace("\n", " ")
+    return s if len(s) <= LIMIT else s[:LIMIT] + "..."
+
+
+text = LOG.read_text() if LOG.exists() else ""
+records = SEP.split(text)
+
+# Records alternate: separator-trailing chunks. A complete record sits in
+# pairs — odd index = header line, even (next) index = body containing Q/A.
+i = 0
+while i < len(records):
+    chunk = records[i].strip()
+    if chunk.startswith("[20") and i + 1 < len(records):
+        body = records[i + 1]
+        q_match = re.search(r"Q:\n(.*?)(?:\nA:\n|\Z)", body, re.DOTALL)
+        a_match = re.search(r"A:\n(.*)", body, re.DOTALL)
+        q = trim(q_match.group(1)) if q_match else ""
+        a = trim(a_match.group(1)) if a_match else ""
+        print(chunk)
+        print(f"  Q: {q}")
+        print(f"  A: {a}")
+        print()
+        i += 2
+    else:
+        i += 1

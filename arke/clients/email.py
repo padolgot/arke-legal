@@ -252,6 +252,23 @@ def _send_reply(
 
 # --- processing pipeline ------------------------------------------------------
 
+def _log_transcript(workspace_path: Path, sender: str, subject: str, query: str, answer: str) -> None:
+    """Append a chat-style record to chat.log for `tail -f` monitoring."""
+    import datetime
+    path = workspace_path / "chat.log"
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    sep = "=" * 78
+    record = (
+        f"\n{sep}\n"
+        f"[{ts}] FROM {sender}  |  SUBJ: {subject}\n"
+        f"{sep}\n"
+        f"Q:\n{query.strip()}\n\n"
+        f"A:\n{answer.strip()}\n"
+    )
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(record)
+
+
 def _process_inbound(cfg: EmailConfig, raw_mime: bytes) -> None:
     from arke.server import mailbox as arke_mailbox
 
@@ -280,6 +297,8 @@ def _process_inbound(cfg: EmailConfig, raw_mime: bytes) -> None:
         else:
             answer_md = "Arke could not process your request at this time."
             citations = []
+
+        _log_transcript(cfg.workspace_path, sender, subject, query, answer_md)
 
         html_body = _build_html_reply(answer_md, citations)
         reply_subject = subject if subject.lower().startswith("re:") else f"Re: {subject}"

@@ -26,39 +26,11 @@ from .models import LLM, Models
 from .workspace import mount as mount_workspace
 from .types import Chunk, Doc, SearchHit
 
+from .prompts import CASE_NAME_PROMPT
+
 CASE_NAME_TABLE = "case_names"
 CASE_NAME_EXTRACT_CHARS = 2000
 CASE_NAME_WORKERS = 10
-CASE_NAME_PROMPT = (
-    "Return a one-line label for this document.\n"
-    "\n"
-    "FIRST decide: is this a court judgment with named parties?\n"
-    "\n"
-    "IF YES → return ONLY the case title. Nothing else.\n"
-    "Format: 'Party A v Party B [Year]' — year in square brackets ONLY if "
-    "clearly stated in the document. If year is absent, omit the brackets "
-    "entirely — never write the literal '[Year]'.\n"
-    "Do NOT prefix with 'Case judgment,', 'Judgment on,', 'Court decision,' "
-    "or any descriptor. The case title stands alone.\n"
-    "  Caparo Industries v Dickman [1990]\n"
-    "  R (Miller) v Prime Minister [2019]\n"
-    "  Baird Textile Holdings Ltd v Marks and Spencer plc\n"
-    "\n"
-    "IF NO (contract, memo, letter, witness statement, expert report, opinion, "
-    "email, pleading, research note, etc.) → return a brief descriptor: "
-    "document type + subject + date if available.\n"
-    "  Engagement letter, Smith Holdings audit, January 2022\n"
-    "  Witness statement of James Wilson, March 2024\n"
-    "  Expert report on construction defects, Dr Jane Smith, 2020\n"
-    "\n"
-    "Hard rules:\n"
-    "- One line, plain text, no quotes, no trailing punctuation.\n"
-    "- Never include the word 'unknown' inside the label — if a party or date "
-    "is unknown, omit that piece.\n"
-    "- Never include literal placeholders like '[Year]' or '[Date]'.\n"
-    "- If the document's nature is genuinely impossible to identify at all, "
-    "return exactly the single word: unknown"
-)
 
 logger = logging.getLogger(__name__)
 

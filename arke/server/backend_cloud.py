@@ -8,8 +8,8 @@ import urllib.request
 from dataclasses import dataclass
 
 EMBED_BATCH_SIZE = 2048
-RETRY_ATTEMPTS = 5
-RETRY_BASE_DELAY = 2.0
+RETRY_ATTEMPTS = 8
+RETRY_BASE_DELAY = 3.0
 
 logger = logging.getLogger(__name__)
 
@@ -47,12 +47,18 @@ class CloudLLM:
     api_key: str
     model: str
 
-    def chat(self, system: str | None, user: str) -> str:
+    def chat(self, system: str | None, user: str, temperature: float = 0.3) -> str:
+        # Default temperature=0.3 across all stages. We don't need
+        # determinism — only statistical reliability. At 0 gpt-4o-mini
+        # collapses into "select all" on bulk filter prompts (Stage 4) and
+        # gpt-4o picks the safe-harbour exit on Stage 5 curation. 0.3 keeps
+        # outputs natural without introducing creative drift.
         messages: list[dict] = []
         if system is not None:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": user})
-        res = _post(self.base_url, self.api_key, "/v1/chat/completions", {"model": self.model, "messages": messages})
+        body = {"model": self.model, "messages": messages, "temperature": temperature}
+        res = _post(self.base_url, self.api_key, "/v1/chat/completions", body)
         return res["choices"][0]["message"]["content"]
 
 
@@ -83,9 +89,11 @@ def _post(base_url: str, api_key: str, path: str, body: dict) -> dict:
             if not retriable or last_attempt:
                 raise
             retry_after = e.headers.get("Retry-After") if e.headers else None
-            base = float(retry_after) if retry_after and retry_after.replace(".", "").isdigit() else delay
+            ra = float(retry_after) if retry_after and retry_after.replace(".", "").isdigit() else 0.0
+            # Use max of server hint and our exponential — server hint is often
+            # too short (1-2s) to clear a 60s TPM window with 4 concurrent workers.
             # Jitter prevents thundering-herd retries from concurrent workers.
-            wait = base + random.uniform(0, 1.5)
+            wait = max(ra, delay) + random.uniform(0, 1.5)
             logger.warning("cloud %s %d — retry in %.1fs (attempt %d/%d)", path, e.code, wait, attempt + 1, RETRY_ATTEMPTS)
             time.sleep(wait)
             delay *= 2
