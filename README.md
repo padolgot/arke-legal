@@ -59,22 +59,6 @@ arke-sync
 
 PDF, DOCX, MSG (Outlook), TXT, Markdown.
 
-## Configuration
-
-All via environment variables (`.env`):
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `ARKE_WORKSPACE` | `default` | Workspace name |
-| `CHUNK_SIZE` | `600` | Characters per chunk |
-| `OVERLAP` | `0.0` | Overlap fraction (0–0.5) |
-| `ALPHA` | `0.7` | Blend: 1.0 = pure semantic, 0.0 = pure keyword |
-| `K` | `5` | Top-k results passed to LLM |
-
-## Getting it into your firm
-
-Arke is open source under MIT. Clone it, run it, own it.
-
 ## Public demo
 
 `ask@arke.legal` — a live instance running on a UK CAT + EU competition law corpus. Send a pleading, get the counter-authorities back.

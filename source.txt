@@ -1,5 +1,5 @@
 # Arke Terminal — Source Dump
-# Generated: 2026-04-28T11:43:13Z
+# Generated: 2026-04-28T12:07:22Z
 
 # ═══════════════════════════════════════════
 # README.md
@@ -65,22 +65,6 @@ arke-sync
 ## Input formats
 
 PDF, DOCX, MSG (Outlook), TXT, Markdown.
-
-## Configuration
-
-All via environment variables (`.env`):
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `ARKE_WORKSPACE` | `default` | Workspace name |
-| `CHUNK_SIZE` | `600` | Characters per chunk |
-| `OVERLAP` | `0.0` | Overlap fraction (0–0.5) |
-| `ALPHA` | `0.7` | Blend: 1.0 = pure semantic, 0.0 = pure keyword |
-| `K` | `5` | Top-k results passed to LLM |
-
-## Getting it into your firm
-
-Arke is open source under MIT. Clone it, run it, own it.
 
 ## Public demo
 
@@ -2951,7 +2935,7 @@ def path_for(name: str, home: str | Path = ARKE_HOME) -> Path:
 
 [project]
 name = "arke"
-version = "0.1.405"
+version = "0.1.445"
 description = "Local-first RAG for legal teams."
 requires-python = ">=3.12"
 license = "MIT"
