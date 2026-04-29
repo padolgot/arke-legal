@@ -4,9 +4,21 @@
 
 [ -f pyproject.toml ] || exit 0
 
+# --- Dot-prefix gate ---
+# Any path component starting with `.` is local-only by default. Public repo;
+# one slip leaks contact data, voice files, strategy. Whitelist hardcoded below.
+DOT_WHITELIST='^\.gitignore$'
+violations=$(git diff --cached --name-only | grep -E '(^|/)\.' | grep -vE "$DOT_WHITELIST")
+if [ -n "$violations" ]; then
+    echo "commit blocked: dot-prefixed paths are local-only by default"
+    echo "$violations"
+    echo "whitelist: .gitignore"
+    exit 1
+fi
+
 # --- Source dump ---
 {
-    echo "# Arke Terminal — Source Dump"
+    echo "# Arke — Source Code"
     echo "# Generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo ""
     [ -f README.md ] && {

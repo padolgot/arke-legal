@@ -7,16 +7,10 @@ build/
 dist/
 venv/
 
-# All dot-directories
-.*/
-
-# Env files
-.env
-.env.*
-!.env.example
-
-# Logs
-*.log
+# All dotfiles and dot-directories — local-only by default.
+.*
+!.gitignore
 
 # Project-local
 CLAUDE.md
+DESIGN.md
