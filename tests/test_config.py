@@ -1,68 +1,93 @@
 import pytest
 
-pytest.skip("obsolete: Config API rewritten (new fields: space, backend, cloud_*); rewrite in phase 2", allow_module_level=True)
-
-from arke.server.config import Config, DEFAULTS  # noqa: E402
+from arke.server.config import DEFAULTS, Config
 
 
-def test_resolved_fills_defaults():
-    cfg = Config(database_url="postgresql://localhost/test", data_path="/tmp").resolved()
-    assert cfg.embedder_url == DEFAULTS.embedder_url
-    assert cfg.embedder_model == DEFAULTS.embedder_model
-    assert cfg.embedding_dim == DEFAULTS.embedding_dim
-    assert cfg.inference_url == DEFAULTS.inference_url
-    assert cfg.inference_model == DEFAULTS.inference_model
-
-
-def test_resolved_keeps_explicit_values():
+def test_resolved_fills_default_embedding_dim():
     cfg = Config(
-        database_url="postgresql://localhost/test",
-        data_path="/tmp",
-        embedder_url="http://custom:1234",
-        embedder_model="custom-model",
+        backend="local",
+        embed_model_path="/tmp/embed.gguf",
+        inference_model_path="/tmp/inf.gguf",
+    ).resolved()
+    assert cfg.embedding_dim == DEFAULTS.embedding_dim
+
+
+def test_resolved_keeps_explicit_embedding_dim():
+    cfg = Config(
+        backend="local",
+        embed_model_path="/tmp/embed.gguf",
+        inference_model_path="/tmp/inf.gguf",
         embedding_dim=768,
     ).resolved()
-    assert cfg.embedder_url == "http://custom:1234"
-    assert cfg.embedder_model == "custom-model"
     assert cfg.embedding_dim == 768
 
 
-def test_resolved_requires_database_url():
-    with pytest.raises(ValueError, match="database_url"):
-        Config().resolved()
+def test_local_requires_embed_model_path():
+    with pytest.raises(ValueError, match="EMBED_MODEL_PATH"):
+        Config(backend="local", inference_model_path="/tmp/inf.gguf").resolved()
 
 
-def test_resolved_validates_chunk_size():
+def test_local_requires_inference_model_path():
+    with pytest.raises(ValueError, match="INFERENCE_MODEL_PATH"):
+        Config(backend="local", embed_model_path="/tmp/embed.gguf").resolved()
+
+
+def test_cloud_requires_api_key():
+    with pytest.raises(ValueError, match="CLOUD_API_KEY"):
+        Config(backend="cloud").resolved()
+
+
+def test_cloud_resolves_with_api_key():
+    cfg = Config(backend="cloud", cloud_api_key="sk-xxx").resolved()
+    assert cfg.backend == "cloud"
+
+
+def test_unknown_backend_rejected():
+    with pytest.raises(ValueError, match="BACKEND"):
+        Config(backend="quantum").resolved()
+
+
+def test_chunk_size_bounds():
+    base = dict(backend="cloud", cloud_api_key="sk-x")
     with pytest.raises(ValueError, match="chunk_size"):
-        Config(database_url="postgresql://x", data_path="/tmp", chunk_size=50).resolved()
+        Config(**base, chunk_size=50).resolved()
     with pytest.raises(ValueError, match="chunk_size"):
-        Config(database_url="postgresql://x", data_path="/tmp", chunk_size=20000).resolved()
+        Config(**base, chunk_size=20000).resolved()
 
 
-def test_resolved_validates_overlap():
+def test_overlap_bounds():
+    base = dict(backend="cloud", cloud_api_key="sk-x")
     with pytest.raises(ValueError, match="overlap"):
-        Config(database_url="postgresql://x", data_path="/tmp", overlap=0.8).resolved()
+        Config(**base, overlap=0.8).resolved()
     with pytest.raises(ValueError, match="overlap"):
-        Config(database_url="postgresql://x", data_path="/tmp", overlap=-0.1).resolved()
+        Config(**base, overlap=-0.1).resolved()
 
 
-def test_resolved_validates_alpha():
+def test_alpha_bounds():
+    base = dict(backend="cloud", cloud_api_key="sk-x")
     with pytest.raises(ValueError, match="alpha"):
-        Config(database_url="postgresql://x", data_path="/tmp", alpha=1.5).resolved()
+        Config(**base, alpha=1.5).resolved()
+    with pytest.raises(ValueError, match="alpha"):
+        Config(**base, alpha=-0.1).resolved()
 
 
-def test_resolved_validates_k():
+def test_k_bounds():
+    base = dict(backend="cloud", cloud_api_key="sk-x")
     with pytest.raises(ValueError, match="k"):
-        Config(database_url="postgresql://x", data_path="/tmp", k=0).resolved()
+        Config(**base, k=0).resolved()
     with pytest.raises(ValueError, match="k"):
-        Config(database_url="postgresql://x", data_path="/tmp", k=25).resolved()
+        Config(**base, k=25).resolved()
 
 
-def test_from_env(monkeypatch):
-    monkeypatch.setenv("DATABASE_URL", "postgresql://test")
-    monkeypatch.setenv("EMBEDDER_MODEL", "test-model")
+def test_from_env_reads_variables(monkeypatch):
+    monkeypatch.setenv("ARKE_WORKSPACE", "demo")
+    monkeypatch.setenv("BACKEND", "cloud")
+    monkeypatch.setenv("CLOUD_API_KEY", "sk-test")
     monkeypatch.setenv("EMBEDDING_DIM", "768")
+    monkeypatch.setenv("CHUNK_SIZE", "500")
     cfg = Config.from_env()
-    assert cfg.database_url == "postgresql://test"
-    assert cfg.embedder_model == "test-model"
+    assert cfg.workspace == "demo"
+    assert cfg.backend == "cloud"
+    assert cfg.cloud_api_key == "sk-test"
     assert cfg.embedding_dim == 768
+    assert cfg.chunk_size == 500

@@ -1,88 +1,95 @@
 import json
-from pathlib import Path
 
-import pytest
-
-pytest.skip("obsolete: old Doc.content API; rewrite against new Doc/sdb in phase 2", allow_module_level=True)
-
-from arke.loader import load_docs  # noqa: E402
+from arke.server.loader import load_corpus, load_digest, load_file
 
 
-def test_loads_valid_jsonl(tmp_path):
-    f = tmp_path / "docs.jsonl"
-    f.write_text(json.dumps({"content": "hello world"}) + "\n")
-    docs = load_docs(str(f))
-    assert len(docs) == 1
-    assert docs[0].content == "hello world"
-    assert docs[0].source == "docs"
+def test_load_file_txt(tmp_path):
+    f = tmp_path / "policy.txt"
+    f.write_text("privacy policy content")
+    result = load_file(f)
+    assert result is not None
+    doc, text = result
+    assert text == "privacy policy content"
+    assert doc.source == "policy.txt"
+    assert doc.metadata["suffix"] == ".txt"
 
 
-def test_skips_invalid_json(tmp_path):
-    f = tmp_path / "docs.jsonl"
-    f.write_text("not json\n" + json.dumps({"content": "valid"}) + "\n")
-    docs = load_docs(str(f))
-    assert len(docs) == 1
-    assert docs[0].content == "valid"
+def test_load_file_md(tmp_path):
+    f = tmp_path / "note.md"
+    f.write_text("# Heading\n\nbody")
+    result = load_file(f)
+    assert result is not None
+    doc, text = result
+    assert "Heading" in text
+    assert doc.metadata["suffix"] == ".md"
 
 
-def test_skips_missing_content(tmp_path):
-    f = tmp_path / "docs.jsonl"
-    lines = [
-        json.dumps({"content": ""}),
-        json.dumps({"title": "no content field"}),
-        json.dumps({"content": "  "}),
-        json.dumps({"content": "good"}),
-    ]
-    f.write_text("\n".join(lines))
-    docs = load_docs(str(f))
-    assert len(docs) == 1
-    assert docs[0].content == "good"
+def test_load_file_unsupported_returns_none(tmp_path):
+    f = tmp_path / "binary.xyz"
+    f.write_bytes(b"\x00\x01\x02")
+    assert load_file(f) is None
 
 
-def test_uses_custom_source(tmp_path):
-    f = tmp_path / "docs.jsonl"
-    f.write_text(json.dumps({"content": "x", "source": "custom"}) + "\n")
-    docs = load_docs(str(f))
-    assert docs[0].source == "custom"
+def test_load_file_empty_returns_none(tmp_path):
+    f = tmp_path / "empty.txt"
+    f.write_text("")
+    assert load_file(f) is None
 
 
-def test_parses_created_at(tmp_path):
-    f = tmp_path / "docs.jsonl"
-    f.write_text(json.dumps({"content": "x", "created_at": "2026-01-15T10:00:00Z"}) + "\n")
-    docs = load_docs(str(f))
-    assert docs[0].created_at.year == 2026
-    assert docs[0].created_at.month == 1
+def test_load_file_whitespace_only_returns_none(tmp_path):
+    f = tmp_path / "blank.txt"
+    f.write_text("   \n\n  \t  \n")
+    assert load_file(f) is None
 
 
-def test_loads_directory(tmp_path):
-    (tmp_path / "a.jsonl").write_text(json.dumps({"content": "one"}) + "\n")
-    (tmp_path / "b.jsonl").write_text(json.dumps({"content": "two"}) + "\n")
-    docs = load_docs(str(tmp_path))
-    assert len(docs) == 2
-
-
-def test_preserves_metadata(tmp_path):
-    f = tmp_path / "docs.jsonl"
-    f.write_text(json.dumps({"content": "x", "metadata": {"tag": "test"}}) + "\n")
-    docs = load_docs(str(f))
-    assert docs[0].metadata == {"tag": "test"}
-
-
-def test_loads_txt_files(tmp_path):
+def test_load_file_relative_source_under_root(tmp_path):
     sub = tmp_path / "contracts"
     sub.mkdir()
-    (sub / "nda.txt").write_text("This is a non-disclosure agreement.")
-    (tmp_path / "policy.txt").write_text("Privacy policy content here.")
-    docs = load_docs(str(tmp_path))
-    assert len(docs) == 2
-    sources = {d.source for d in docs}
-    assert "contracts/nda.txt" in sources
-    assert "policy.txt" in sources
+    f = sub / "nda.txt"
+    f.write_text("non-disclosure")
+    doc, _ = load_file(f, root=tmp_path)
+    assert doc.source == "contracts/nda.txt"
 
 
-def test_skips_empty_txt(tmp_path):
-    (tmp_path / "empty.txt").write_text("")
+def test_load_digest_walks_tree(tmp_path):
+    (tmp_path / "a.txt").write_text("alpha")
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    (sub / "b.md").write_text("beta")
+    (tmp_path / "skip.xyz").write_bytes(b"binary")
+    (tmp_path / ".hidden.txt").write_text("hidden")
+
+    results = load_digest(tmp_path)
+    sources = {doc.source for doc, _ in results}
+    assert sources == {"a.txt", "sub/b.md"}
+
+
+def test_load_corpus_reads_manifest(tmp_path):
+    text_path = tmp_path / "case.txt"
+    text_path.write_text("judgment body")
+    manifest = tmp_path / "manifest.jsonl"
+    manifest.write_text(json.dumps({
+        "doc_id": "uk/cat/2023/abc",
+        "corpus_path": "case.txt",
+        "title": "Smith v Jones",
+    }) + "\n")
+
+    results = load_corpus(tmp_path)
+    assert len(results) == 1
+    doc, text = results[0]
+    assert text == "judgment body"
+    assert doc.id == "uk/cat/2023/abc"
+    assert doc.metadata["case_name"] == "Smith v Jones"
+
+
+def test_load_corpus_skips_empty_text(tmp_path):
+    (tmp_path / "empty.txt").write_text("   ")
     (tmp_path / "good.txt").write_text("real content")
-    docs = load_docs(str(tmp_path))
-    assert len(docs) == 1
-    assert docs[0].content == "real content"
+    manifest = tmp_path / "manifest.jsonl"
+    manifest.write_text(
+        json.dumps({"doc_id": "1", "corpus_path": "empty.txt", "title": ""}) + "\n"
+        + json.dumps({"doc_id": "2", "corpus_path": "good.txt", "title": "Good"}) + "\n"
+    )
+    results = load_corpus(tmp_path)
+    assert len(results) == 1
+    assert results[0][0].id == "2"
