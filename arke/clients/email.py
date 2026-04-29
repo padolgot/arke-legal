@@ -10,6 +10,7 @@ Threading: HTTP server spawns a thread per request so a long stress-test
 with UUID keys — no shared state between threads.
 """
 
+import datetime
 import email
 import email.policy
 import email.utils
@@ -42,7 +43,11 @@ BLOCKQUOTE_STYLE = "margin:6px 0;padding:4px 12px;border-left:3px solid #bbb"
 SOURCE_LINE_STYLE = "margin:2px 0 14px 0;font-size:10pt;color:#888;font-style:italic;text-align:left"
 FOOTER_STYLE = "margin:28px 0 0 0;padding-top:12px;border-top:1px solid #eee;font-size:9.5pt;color:#888"
 
-FOOTER_HTML = "🏺 Arke — public demo on UK & EU competition law"
+FOOTER_HTML = (
+    'public demo on UK &amp; EU competition law<br>'
+    '<a href="https://github.com/padolgot/arke" style="color:#888">github.com/padolgot/arke</a><br>'
+    '<a href="https://linkedin.com/in/padolgot" style="color:#888">linkedin.com/in/padolgot</a>'
+)
 
 
 @dataclass(frozen=True)
@@ -253,20 +258,17 @@ def _send_reply(
 # --- processing pipeline ------------------------------------------------------
 
 def _log_transcript(workspace_path: Path, sender: str, subject: str, query: str, answer: str) -> None:
-    """Append a chat-style record to chat.log for `tail -f` monitoring."""
-    import datetime
-    path = workspace_path / "chat.log"
-    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    sep = "=" * 78
-    record = (
-        f"\n{sep}\n"
-        f"[{ts}] FROM {sender}  |  SUBJ: {subject}\n"
-        f"{sep}\n"
-        f"Q:\n{query.strip()}\n\n"
-        f"A:\n{answer.strip()}\n"
-    )
+    """Append one JSON record per chat to chat.jsonl. Tail with jq for live view."""
+    path = workspace_path / "chat.jsonl"
+    record = {
+        "ts": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "from": sender,
+        "subject": subject,
+        "query": query.strip(),
+        "answer": answer.strip(),
+    }
     with path.open("a", encoding="utf-8") as fh:
-        fh.write(record)
+        fh.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 def _process_inbound(cfg: EmailConfig, raw_mime: bytes) -> None:
@@ -411,9 +413,9 @@ def run(cfg: EmailConfig) -> None:
 
 
 def main() -> None:
-    from dotenv import load_dotenv
+    from dotenv import find_dotenv, load_dotenv
 
-    load_dotenv()
+    load_dotenv(find_dotenv())
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     run(EmailConfig.from_env())
 
