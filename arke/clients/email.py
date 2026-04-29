@@ -46,7 +46,7 @@ FOOTER_STYLE = "margin:28px 0 0 0;padding-top:12px;border-top:1px solid #eee;fon
 FOOTER_HTML = (
     'Public demo on UK &amp; EU competition law<br>'
     'Source code: <a href="https://github.com/padolgot/arke" style="color:#888">github.com/padolgot/arke</a><br>'
-    'Contact: <a href="https://linkedin.com/in/padolgot" style="color:#888">linkedin.com/in/padolgot</a>'
+    'Built by: <a href="https://linkedin.com/in/padolgot" style="color:#888">linkedin.com/in/padolgot</a>'
 )
 
 

@@ -1,5 +1,5 @@
 # Arke — Source Code
-# Generated: 2026-04-29T21:53:52Z
+# Generated: 2026-04-29T21:54:53Z
 
 # ═══════════════════════════════════════════
 # README.md
@@ -202,7 +202,7 @@ FOOTER_STYLE = "margin:28px 0 0 0;padding-top:12px;border-top:1px solid #eee;fon
 FOOTER_HTML = (
     'Public demo on UK &amp; EU competition law<br>'
     'Source code: <a href="https://github.com/padolgot/arke" style="color:#888">github.com/padolgot/arke</a><br>'
-    'Contact: <a href="https://linkedin.com/in/padolgot" style="color:#888">linkedin.com/in/padolgot</a>'
+    'Built by: <a href="https://linkedin.com/in/padolgot" style="color:#888">linkedin.com/in/padolgot</a>'
 )
 
 
@@ -10149,7 +10149,7 @@ def path_for(name: str, home: str | Path = ARKE_HOME) -> Path:
 
 [project]
 name = "arke"
-version = "0.1.477"
+version = "0.1.479"
 description = "Local-first RAG for legal teams."
 requires-python = ">=3.12"
 license = "MIT"
