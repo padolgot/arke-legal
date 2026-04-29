@@ -1,7 +1,5 @@
 # 🏺 Arke
 
-**Authority retrieval over your firm's corpus. Privately. Via email.**
-
 Arke reads your firm's corpus and answers your questions with direct citations — nothing else. No summarisation, no LLM paraphrase, no cloud round-trip. Built for litigators and dispute partners who want to surface the counter-case already hiding in their own documents.
 
 Arke never edits your documents — it only caches them, read-only. Worst case, retrieval comes back thin; your data stays on your server and never leaves your network. Best case, you have an always-available retrieval layer surfacing the counter-authority you'd want to know about before court.
