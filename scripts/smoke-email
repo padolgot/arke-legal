@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+"""Post-deploy smoke test — full email pipeline end-to-end.
+
+PROMPT SPEC (for Claude — read before running):
+
+You generate the argument text yourself before each run. The text must be:
+  • One short paragraph, 3-6 sentences, free-form prose
+  • Voice of a junior associate-litigator scribbling a rough stress-test
+    argument before passing it to a senior — at, say, Charles Lyndon
+  • A legal proposition you'd push back on — competition law topic
+  • No quotes, no citations, no template scaffolding
+  • Tied to whatever we've just been working on in this session, OR freshly
+    creative if nothing relevant — vary it every time
+  • Small but substantive — enough that Arke retrieves and replies coherently
+
+Not random corpus chunks. Not a fixed list. Not a polished pleading. You
+write it fresh each invocation; the variation itself proves you've
+internalised the context of the change being smoke-tested.
+
+Then run:
+    uv run scripts/smoke-email "the argument text"
+
+The script:
+  - POSTs the argument to localhost:8080/inbound, retries on connection
+    refused with reactive polling — no fixed sleep before action.
+  - After dispatch, tails chat.jsonl for the new Q/A pair and prints the
+    answer to stdout so you read what the operator sees over SMTP.
+
+Recipient = `git config user.email`. Local-only by virtue of the localhost
+POST.
+"""
+import email.message
+import email.utils
+import json
+import subprocess
+import sys
+import time
+
+import requests
+
+from arke.server.workspace import path_for
+
+WORKSPACE = "comp"
+INBOUND_URL = "http://localhost:8080/inbound"
+POST_BUDGET_S = 30.0     # total time to wait for arke-mail to come up
+REPLY_BUDGET_S = 180.0   # full pipeline (LLM stages) can take 1-3 min
+POLL_INTERVAL_S = 0.5    # reactive poll, not a fixed pre-action delay
+
+if len(sys.argv) < 2 or not sys.argv[1].strip():
+    sys.exit("smoke-email: pass the argument text as one quoted CLI arg")
+argument = sys.argv[1].strip()
+
+try:
+    to_addr = subprocess.check_output(
+        ["git", "config", "--get", "user.email"], text=True, stderr=subprocess.DEVNULL,
+    ).strip()
+except subprocess.CalledProcessError:
+    to_addr = ""
+if not to_addr:
+    sys.exit("smoke-email: `git config user.email` is empty — set it first")
+
+ws = path_for(WORKSPACE)
+chat_log = ws / "chat.jsonl"
+before_n = len(chat_log.read_text().splitlines()) if chat_log.exists() else 0
+
+msg = email.message.EmailMessage()
+msg["From"] = to_addr
+msg["To"] = "ask@arke.legal"
+msg["Subject"] = "smoke"
+msg["Message-ID"] = email.utils.make_msgid(domain="smoke.local")
+msg.set_content(argument)
+
+deadline = time.monotonic() + POST_BUDGET_S
+last_err: Exception | None = None
+while True:
+    try:
+        r = requests.post(
+            INBOUND_URL,
+            files={"email": ("inbound.eml", msg.as_bytes(), "application/octet-stream")},
+            timeout=10,
+        )
+        r.raise_for_status()
+        break
+    except requests.RequestException as e:
+        last_err = e
+        if time.monotonic() > deadline:
+            sys.exit(f"smoke-email: arke-mail unreachable on :8080 — {last_err}")
+        time.sleep(POLL_INTERVAL_S)
+
+print(f"smoke: dispatched → {to_addr}")
+
+deadline = time.monotonic() + REPLY_BUDGET_S
+while time.monotonic() < deadline:
+    if chat_log.exists():
+        lines = chat_log.read_text().splitlines()
+        if len(lines) > before_n:
+            rec = json.loads(lines[-1])
+            print()
+            print("=" * 78)
+            print(f"Q: {(rec.get('query') or '')[:300]}")
+            print()
+            print(f"A: {rec.get('answer') or ''}")
+            print("=" * 78)
+            sys.exit(0)
+    time.sleep(POLL_INTERVAL_S)
+
+sys.exit(f"smoke-email: timeout waiting for reply (>{REPLY_BUDGET_S:.0f}s)")
