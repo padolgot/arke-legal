@@ -188,8 +188,8 @@ def _print_table(rows: list[SweepRow]) -> None:
 def main() -> None:
     import argparse
 
-    from dotenv import load_dotenv
-    load_dotenv()
+    from dotenv import find_dotenv, load_dotenv
+    load_dotenv(find_dotenv())
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     parser = argparse.ArgumentParser()
     parser.add_argument("--workspace", required=True)

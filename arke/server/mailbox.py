@@ -1,8 +1,8 @@
 """Inbox/outbox file queue. Arke's only coordination primitive.
 
 Layout:
-    ~/.arke/workspaces/<name>/inbox/<uuid>.json   — incoming request
-    ~/.arke/workspaces/<name>/outbox/<uuid>.json  — response written by Arke
+    <umbrella>/workspaces/<name>/inbox/<uuid>.json   — incoming request
+    <umbrella>/workspaces/<name>/outbox/<uuid>.json  — response written by Arke
 
 Writers drop a file in inbox and poll outbox for the response.
 Arke scans inbox on every tick, processes, writes outbox.

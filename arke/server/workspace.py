@@ -3,8 +3,8 @@
 Each workspace has its own sdb root. Switching workspaces is just
 calling mount() with a different name.
 
-Layout:
-    ~/.arke/workspaces/<name>/
+Layout (sibling of the engine repo, under a shared umbrella):
+    <umbrella>/workspaces/<name>/
         data/      — sdb root (documents, embeddings, sources)
         digest/    — drop documents here; Arke ingests on change
         inbox/     — incoming requests
@@ -19,7 +19,9 @@ from pathlib import Path
 
 from . import sdb
 
-ARKE_HOME = Path(os.environ.get("ARKE_ROOT") or (Path.home() / ".arke"))
+# Umbrella = repo's parent. workspace.py lives at <umbrella>/<repo>/arke/server/workspace.py.
+_UMBRELLA = Path(__file__).resolve().parent.parent.parent.parent
+ARKE_HOME = Path(os.environ.get("ARKE_ROOT") or _UMBRELLA)
 
 
 @dataclass(frozen=True)

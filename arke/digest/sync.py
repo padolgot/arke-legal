@@ -139,14 +139,15 @@ def _parse_sources(raw: str) -> list[RcloneSource]:
 
 
 def main() -> None:
-    from dotenv import load_dotenv
+    from dotenv import find_dotenv, load_dotenv
 
-    load_dotenv()
+    load_dotenv(find_dotenv())
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
+    from arke.server.workspace import path_for
+
     workspace_name = os.environ.get("ARKE_WORKSPACE", "default")
-    arke_root = Path(os.environ.get("ARKE_ROOT") or Path.home() / ".arke")
-    workspace_path = arke_root / "workspaces" / workspace_name
+    workspace_path = path_for(workspace_name)
     workspace_path.mkdir(parents=True, exist_ok=True)
 
     raw_sources = os.environ.get("ARKE_SOURCES", "").strip()
