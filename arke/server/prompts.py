@@ -43,8 +43,8 @@ PER_DOC_PROMPT = (
 )
 
 # Stage 5 — strong LLM curates the final mosaic across all surviving docs.
-# Sees the big picture; drops noisy/duplicate passages; carves an ensemble of
-# labels. Single-source preserved structurally by the per-doc JSON schema.
+# Selection only, no generation. Drops noisy/duplicate passages; headings
+# come deterministically from source metadata, not from the model.
 MOSAIC_SYSTEM_PROMPT = (
     "You curate the final adversarial mosaic the lawyer will rely on. The "
     "input is a JSON object: keys are document identifiers, values are "
@@ -52,10 +52,7 @@ MOSAIC_SYSTEM_PROMPT = (
     "as broadly hostile. You see all documents at once.\n"
     "\n"
     "For each document, KEEP the one or two passages whose ratio or holding "
-    "lands hardest against the lawyer's argument, and write a label — a "
-    "tight legal proposition (single phrase, doctrinal, specific to the "
-    "argument, not a case name) that THIS document establishes against the "
-    "position. The label must be supported by the kept passages.\n"
+    "lands hardest against the lawyer's argument.\n"
     "\n"
     "Each surviving document keeps its own passages — never merge across "
     "documents (the schema forbids it).\n"
@@ -63,20 +60,13 @@ MOSAIC_SYSTEM_PROMPT = (
     "Where two documents establish substantially the same proposition, keep "
     "the one whose passages state it most directly; drop the weaker echo.\n"
     "\n"
-    "The labels across surviving documents form an ENSEMBLE — read them in "
-    "sequence and they should sound like strikes in the same key, "
-    "complementary in force, no two saying the same thing.\n"
-    "\n"
     "Output STRICTLY a JSON object — same keys as input, only for docs you "
     "kept:\n"
-    '{"<doc_key>": {"keep": [<passage indices to keep>], "label": "<phrase>"}, ...}\n'
+    '{"<doc_key>": {"keep": [<passage indices to keep>]}, ...}\n'
     "\n"
     "Rules:\n"
     "- keep: list of 0-indexed passage positions from that document. Take "
     "as few as land cleanly; take more only if each adds independent force.\n"
-    "- label: doctrinal proposition AGAINST the lawyer's argument.\n"
-    "  Good: 'Duty found where reliance was specific and known'\n"
-    "  Bad:  'Caparo precedent' (just names case), 'Duty limits' (too generic)\n"
     "- Default to keeping documents that contain genuinely hostile material. "
     "Output {} only when every input document's passages, on close reading, "
     "do not actually attack this argument — not as a safe-harbour exit.\n"

@@ -4,8 +4,9 @@ Pipeline:
   1. hybrid retrieval on the argument
   2. cheap gate on top similarity (drop if corpus is off-topic)
   3. per-doc LLM filter — adversarial chunk selection (parallel across docs)
-  4. mosaic LLM — cluster passages into adversarial authorities with labels
+  4. mosaic LLM — select passages per doc (selection only, no generation)
   5. trimmer LLM — strip procedural narrative, preserving verbatim ratio
+Headings come deterministically from source metadata, never the model.
 """
 import json
 import logging
@@ -66,24 +67,27 @@ def _clean_title(title: str) -> str:
 
 
 def _footer_line(p: dict) -> str:
-    """Build the per-cluster footer: corpus_path | [citation] | title | cited N× · date"""
+    """Per-cluster footer: corpus_path · cited N× · date. Citation + title live in the heading."""
     bits: list[str] = [p["corpus_path"] or p["filename"]]
-    citation = p.get("citation", "")
-    if citation:
-        bits.append(citation if citation.startswith("[") else f"[{citation}]")
-    title = _clean_title(p.get("case_name") or "")
-    if title:
-        bits.append(title)
-    tail: list[str] = []
     cic = p.get("cite_in_count") or 0
     if cic:
-        tail.append(f"cited {cic}×")
+        bits.append(f"cited {cic}×")
     if p.get("date"):
-        tail.append(p["date"])
-    line = " | ".join(bits)
-    if tail:
-        line += " | " + " · ".join(tail)
-    return f"— {line}"
+        bits.append(p["date"])
+    return f"— {' · '.join(bits)}"
+
+
+def _heading(p: dict) -> str:
+    """Deterministic cluster heading from source metadata. No LLM, ever.
+    Prefers party_slug (compact, abbrevs CMA/Ofcom/etc) over full case_name."""
+    citation = p.get("citation", "")
+    if citation and not citation.startswith("["):
+        citation = f"[{citation}]"
+    slug = (p.get("party_slug") or "").replace("-", " ").strip()
+    title = slug or _clean_title(p.get("case_name") or "")
+    if citation and title:
+        return f"{citation} · {title}"
+    return citation or title or p.get("filename", "")
 
 
 def handle(
@@ -161,6 +165,7 @@ def handle(
                 "doc_id": doc.id,
                 "filename": doc.label,
                 "case_name": meta.get("title") or meta.get("case_name") or "",
+                "party_slug": meta.get("party_slug", "") or "",
                 "corpus_path": meta.get("corpus_path", "") or doc.source or doc.label,
                 "citation": (
                     meta.get("neutral_citation")
@@ -181,8 +186,8 @@ def handle(
         return {"ok": True, "answer": NO_ADVERSARIAL_MSG, "citations": []}
 
     # Curate: strong LLM sees ALL docs at once, drops noise/duplicates/
-    # off-key passages, and writes one ensemble label per surviving doc.
-    # Single-source structurally enforced by the per-doc input/output schema.
+    # off-key passages. Selection only — no labels, no generation. Headings
+    # are written deterministically from metadata downstream.
     key_to_doc: dict[str, str] = {}
     curate_input: dict[str, list[str]] = {}
     for i, doc_id in enumerate(doc_passages, start=1):
@@ -190,21 +195,10 @@ def handle(
         key_to_doc[key] = doc_id
         curate_input[key] = [p["text"] for p in doc_passages[doc_id]]
 
-    context_lines = []
-    for key, did in key_to_doc.items():
-        first = doc_passages[did][0]
-        ident = f"{first['case_name']}".strip()
-        if first["citation"]:
-            ident = f"{ident} ({first['citation']})" if ident else first["citation"]
-        context_lines.append(f"- {key}: {ident or first['filename']}")
-
     user_msg = (
         f"Argument:\n{argument}\n\n"
-        "Doc context (case identity for label-writing):\n"
-        + "\n".join(context_lines)
-        + "\n\n"
         "Candidate passages by document — curate (drop, never reorder, never "
-        "merge across docs) and label each surviving doc. Output JSON:\n"
+        "merge across docs). Output JSON:\n"
         + json.dumps(curate_input, ensure_ascii=False, indent=2)
     )
     raw = models.strong_llm.chat(MOSAIC_SYSTEM_PROMPT, user_msg)
@@ -226,18 +220,17 @@ def handle(
         keep = [i for i in decision["keep"] if 0 <= i < len(passages)]
         if not keep:
             continue
-        parts.append(f"## {decision['label']}")
+        parts.append(f"## {_heading(passages[keep[0]])}")
         for i in keep:
             passage = passages[i]
             parts.append(f"> {passage['text']}")
             used.append(passage)
         parts.append(_footer_line(passages[keep[0]]))
         logger.info(
-            "  %s (%s): keep=%s label=%r",
+            "  %s (%s): keep=%s",
             key,
             (passages[0]["case_name"] or "(no name)")[:60],
             keep,
-            decision["label"],
         )
 
     if not parts:
@@ -382,9 +375,8 @@ def hybrid_search(
 
 
 def _parse_curate(raw: str, curate_input: dict[str, list[str]]) -> dict[str, dict]:
-    """Parse strong-LLM curation output: {doc_key: {keep: [int], label: str}}.
-    Validates keys against curate_input, indices against per-doc passage
-    count. Returns only well-formed doc entries; preserves LLM ordering."""
+    """Parse strong-LLM curation output: {doc_key: {keep: [int]}}.
+    Validates keys against curate_input, indices against per-doc passage count."""
     match = re.search(r"\{.*\}", raw, re.DOTALL)
     if not match:
         return {}
@@ -399,12 +391,10 @@ def _parse_curate(raw: str, curate_input: dict[str, list[str]]) -> dict[str, dic
         if key not in curate_input or not isinstance(val, dict):
             continue
         keep = val.get("keep")
-        label = val.get("label")
-        if not isinstance(keep, list) or not isinstance(label, str):
+        if not isinstance(keep, list):
             continue
         n = len(curate_input[key])
         valid_keep = [i for i in keep if isinstance(i, int) and 0 <= i < n]
-        label_clean = label.strip().rstrip(".").strip()
-        if valid_keep and label_clean:
-            out[key] = {"keep": valid_keep, "label": label_clean}
+        if valid_keep:
+            out[key] = {"keep": valid_keep}
     return out
