@@ -8,7 +8,7 @@
 # Any path component starting with `.` is local-only by default. Public repo;
 # one slip leaks contact data, voice files, strategy. Whitelist hardcoded below.
 DOT_WHITELIST='^\.gitignore$'
-violations=$(git diff --cached --name-only | grep -E '(^|/)\.' | grep -vE "$DOT_WHITELIST")
+violations=$(git diff --cached --name-only --diff-filter=AM | grep -E '(^|/)\.' | grep -vE "$DOT_WHITELIST")
 if [ -n "$violations" ]; then
     echo "commit blocked: dot-prefixed paths are local-only by default"
     echo "$violations"
